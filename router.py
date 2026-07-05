@@ -26,6 +26,8 @@ FOLLOW_UP_TRIGGERS = (
     "这件",
     "这个",
     "那个",
+    "这是什么",
+    "这是",
     "刚才",
     "上一件",
     "继续",
@@ -88,6 +90,19 @@ def build_messages(user_message: str, session: DeviceSession) -> list[dict[str, 
                     "say 'you can explain', do not give instructions to a "
                     "guide, and do not describe the answer strategy:\n"
                     f"{json.dumps(artifact_context, ensure_ascii=False)}"
+                ),
+            }
+        )
+
+    if artifact_matches and session.latest_vision_description:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Latest visual observation for the current device. Use it "
+                    "only as supporting visual context, and do not mention "
+                    "internal fields or system context:\n"
+                    f"{session.latest_vision_description}"
                 ),
             }
         )

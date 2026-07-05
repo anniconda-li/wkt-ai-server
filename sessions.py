@@ -45,6 +45,21 @@ def remember_turn(session: DeviceSession, user_message: str, assistant_message: 
     touch_session(session)
 
 
+def set_artifact_context(
+    device_id: str | None,
+    artifact_id: str,
+    vision_description: str | None = None,
+    image_id: str | None = None,
+) -> DeviceSession:
+    session = get_session(device_id)
+    session.upload_generation += 1
+    session.latest_artifact_id = artifact_id
+    session.latest_image_id = image_id
+    session.latest_vision_description = vision_description
+    touch_session(session)
+    return session
+
+
 def clear_session(device_id: str | None) -> None:
     session = get_session(device_id)
     session.memory.clear()

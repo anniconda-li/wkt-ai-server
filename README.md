@@ -9,6 +9,7 @@
 - 按设备隔离的最近 10 轮内存 memory
 - 本地文物知识卡查询
 - 文物追问上下文继承
+- 后端内部文物上下文模拟接口
 - 简单 tool 调用机制
 - OpenAI / DeepSeek / 其他 OpenAI-compatible 服务商
 - Windows PowerShell 下的终端测试客户端
@@ -43,6 +44,7 @@
   -> router.py 构造 messages
   -> router.py 如果识别到文物名称，则加入本地知识卡
   -> router.py 如果是“它/这件/继续讲”等追问，则继承该设备上一件文物
+  -> router.py 如果该设备有最新视觉描述，则作为辅助视觉上下文加入
   -> router.py 判断是否需要调用 tool
   -> llm.py 调用模型 API，stream=True
   -> router.py 一边转发 token，一边收集完整回复
@@ -54,7 +56,7 @@
 
 - `main.py` 负责 HTTP 接口。
 - `router.py` 负责业务编排。
-- `sessions.py` 负责设备上下文和短期记忆。
+- `sessions.py` 负责设备上下文、当前文物和短期记忆。
 - `artifacts.py` 负责加载和查询本地文物知识卡。
 - `llm.py` 负责模型调用。
 - `tools.py` 负责外部工具能力。
@@ -247,6 +249,64 @@ Invoke-RestMethod http://127.0.0.1:8000/sessions/walkie-01
 Invoke-RestMethod -Method POST http://127.0.0.1:8000/sessions/walkie-01/clear
 ```
 
+### POST /sessions/{device_id}/artifact-context
+
+后端内部模拟接口，用来直接设置某台设备“当前正在看的文物”。这一步相当于以后 `/camera/upload` 识别成功后的结果写入，但现在不需要 ESP32，也不需要真的上传图片。
+
+请求：
+
+```json
+{
+  "artifact_id": "yingguo_jade_eagle",
+  "image_id": "local-test-001",
+  "vision_description": "画面中是一件浅色玉质鹰形器，呈展翅姿态，可见线雕羽翼。"
+}
+```
+
+PowerShell 示例：
+
+```powershell
+$body = @{
+  artifact_id = "yingguo_jade_eagle"
+  image_id = "local-test-001"
+  vision_description = "画面中是一件浅色玉质鹰形器，呈展翅姿态，可见线雕羽翼。"
+} | ConvertTo-Json -Compress
+
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/sessions/walkie-01/artifact-context" `
+  -Method POST `
+  -ContentType "application/json; charset=utf-8" `
+  -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
+```
+
+返回：
+
+```json
+{
+  "status": "ready",
+  "device_id": "walkie-01",
+  "latest_artifact_id": "yingguo_jade_eagle",
+  "latest_artifact_name": "应国玉鹰",
+  "latest_image_id": "local-test-001",
+  "latest_vision_description": "画面中是一件浅色玉质鹰形器，呈展翅姿态，可见线雕羽翼。",
+  "upload_generation": 1
+}
+```
+
+然后就可以直接问：
+
+```powershell
+.\.venv\Scripts\python.exe chat_cli.py --device walkie-01
+```
+
+```text
+You> 这是什么？
+AI> 这是应国玉鹰，又称白玉线雕鹰……
+
+You> 它对平顶山市有什么重要意义？
+AI> 它是平顶山“鹰城”文化的重要象征……
+```
+
 ### GET /artifacts
 
 查看本地文物知识卡列表。
@@ -336,6 +396,14 @@ LLM 只负责把已知事实组织成讲解语言
 ```
 
 后端会判断这类句子像追问，并把 `latest_artifact_id` 对应的知识卡再次加入 LLM 上下文。这样回答不是单纯依赖上一轮 assistant 的文本记忆，而是明确继承“当前设备正在看的那件文物”。
+
+在还没接 ESP32 和视觉模型之前，可以使用：
+
+```text
+POST /sessions/{device_id}/artifact-context
+```
+
+手动设置 `latest_artifact_id` 和 `latest_vision_description`。这就是后端内部模拟“拍照识别成功”的方式。等后续真的接入 `/camera/upload` 后，图片识别模块也会写入同样的 session 字段，聊天链路不用重写。
 
 回答生成有一个重要约束：模型输出就是设备端直接展示给游客的内容。因此 prompt 明确要求模型不要输出“讲解时可以这样带”“你可以引导游客观察”这类内部指导语，而是直接生成游客可听可看的讲解文本。知识卡里的 `guide_notes` 只作为后端维护资料保留，当前不会传给模型，避免模型把内部讲解建议原样说给游客。
 
