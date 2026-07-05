@@ -7,6 +7,7 @@ from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
 
+from asr import AsrCancelled, AsrConfigError, AsrError, transcribe_device_wav
 from pipeline import generate_answer_text
 from sessions import normalize_device_id
 from tts import synthesize_to_device_wav
@@ -315,19 +316,59 @@ async def run_asr_stage(session: AiSession) -> None:
         )
         return
 
-    mock_text = os.getenv("AI_MOCK_ASR_TEXT", "").strip()
-    if not mock_text:
+    try:
+        asr_result = await asyncio.to_thread(
+            transcribe_device_wav,
+            session.request_wav_path,
+            lambda: not session.cancel_requested,
+        )
+    except AsrCancelled:
+        set_status(session, "cancelled")
+        logger.info("ai.asr.cancelled session=%s ms=%.1f", session.session_id, elapsed_ms(start))
+        return
+    except AsrConfigError as exc:
+        session.answer_text = os.getenv("AI_ASR_ERROR_TEXT", "语音识别暂时不可用，请稍后再试。")
+        session.tts_status = "skipped"
+        set_status(session, "failed", error=str(exc))
+        logger.info(
+            "ai.asr.config_failed session=%s error=%s ms=%.1f",
+            session.session_id,
+            exc,
+            elapsed_ms(start),
+        )
+        return
+    except AsrError as exc:
+        session.answer_text = os.getenv("AI_ASR_ERROR_TEXT", "语音识别暂时不可用，请稍后再试。")
+        session.tts_status = "skipped"
+        set_status(session, "failed", error=str(exc))
+        logger.info(
+            "ai.asr.failed session=%s error=%s ms=%.1f",
+            session.session_id,
+            exc,
+            elapsed_ms(start),
+        )
+        return
+
+    session.asr_text = asr_result.text.strip()
+    if not session.asr_text:
         session.answer_text = os.getenv("AI_NO_SPEECH_TEXT", "我没有听清，请再说一遍。")
         session.tts_status = "skipped"
         set_status(session, "no_speech")
-        logger.info("ai.asr.unconfigured session=%s ms=%.1f", session.session_id, elapsed_ms(start))
+        logger.info(
+            "ai.asr.empty session=%s provider=%s model=%s ms=%.1f",
+            session.session_id,
+            asr_result.provider,
+            asr_result.model,
+            elapsed_ms(start),
+        )
         return
 
-    session.asr_text = mock_text
     session.touch()
     logger.info(
-        "ai.asr.done session=%s chars=%d ms=%.1f",
+        "ai.asr.done session=%s provider=%s model=%s chars=%d ms=%.1f",
         session.session_id,
+        asr_result.provider,
+        asr_result.model,
         len(session.asr_text),
         elapsed_ms(start),
     )

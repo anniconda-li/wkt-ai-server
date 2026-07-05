@@ -6,13 +6,14 @@
 
 - `/chat` 聊天接口
 - `/camera/upload` JPEG 图片上传接口
-- `/ai/*` ESP32 语音分片上传、轮询结果、按需拉取 WAV 协议骨架
+- `/ai/*` ESP32 语音分片上传、ASR、轮询结果、按需拉取 WAV 协议
 - 本地文本 -> LLM -> TTS -> ESP32 WAV 测试链路
 - 模型 streaming 输出
 - 按设备隔离的最近 10 轮内存 memory
 - 本地文物知识卡查询
 - 文物追问上下文继承
 - DashScope Qwen-VL 图片识别
+- DashScope Paraformer 语音识别
 - DashScope / OpenAI-compatible TTS 输出设备标准 WAV
 - 后端内部文物上下文模拟接口
 - 简单 tool 调用机制
@@ -27,6 +28,7 @@
 .
 ├── main.py           # FastAPI app，定义 HTTP 接口
 ├── ai_protocol.py    # ESP32 /ai 语音协议、session、分片、取消状态
+├── asr.py            # 调用 DashScope Paraformer，把设备 WAV 转成文字
 ├── pipeline.py       # 本地文本 -> LLM -> TTS -> 设备 WAV 流水线
 ├── tts.py            # 调用 TTS 并统一输出 ESP32 标准 WAV
 ├── wav_utils.py      # 设备 WAV 格式校验和测试 WAV 生成
@@ -44,6 +46,7 @@
 ├── chat_cli.py       # 终端聊天客户端，方便本地测试
 ├── camera_upload_cli.py # 终端图片上传测试客户端
 ├── local_text_ask_cli.py # 本地文本问答 + TTS 测试客户端
+├── ai_wav_cli.py     # 模拟 ESP32 /ai 协议上传 WAV 并拉取回复
 ├── requirements.txt  # Python 依赖
 ├── .env.example      # 环境变量示例，不放真实 key
 └── .gitignore        # 忽略 .env、.venv、缓存文件
@@ -111,6 +114,7 @@
 
 - `main.py` 负责 HTTP 接口。
 - `ai_protocol.py` 负责 ESP32 语音协议状态机。
+- `asr.py` 负责调用 DashScope Paraformer，把设备上传的 WAV 转成文字。
 - `pipeline.py` 负责本地文本到回答和 TTS WAV 的完整流水线。
 - `tts.py` 负责调用 TTS，并把返回音频统一成设备要求的 WAV。
 - `wav_utils.py` 负责校验设备要求的 WAV 格式。
@@ -123,6 +127,7 @@
 - `tools.py` 负责外部工具能力。
 - `chat_cli.py` 只是测试客户端，不参与后端核心逻辑。
 - `camera_upload_cli.py` 是图片上传测试客户端，不参与后端核心逻辑。
+- `ai_wav_cli.py` 是设备语音协议测试客户端，不参与后端核心逻辑。
 
 ## 环境准备
 
@@ -154,7 +159,7 @@ OPENAI_BASE_URL=https://api.deepseek.com
 LOG_LEVEL=INFO
 ```
 
-百炼统一配置。视觉识别、后续 ASR、TTS 可以共用这一个 key：
+百炼统一配置。视觉识别、ASR、TTS 可以共用这一个 key：
 
 ```env
 DASHSCOPE_API_KEY=your-dashscope-api-key
@@ -176,11 +181,14 @@ VISION_MIN_CONFIDENCE=0.60
 # VISION_BASE_URL=https://another-compatible-endpoint/v1
 ```
 
-ASR 还没有接入，TTS 已经接入本地文本 pipeline：
+百炼 ASR 和 TTS：
 
 ```env
 ASR_PROVIDER=dashscope
 ASR_MODEL=paraformer-realtime-v2
+# ASR_API_KEY 默认复用 DASHSCOPE_API_KEY
+ASR_FRAME_BYTES=3200
+ASR_FRAME_SLEEP_SECONDS=0
 
 TTS_PROVIDER=dashscope
 TTS_API_STYLE=dashscope_qwen
@@ -215,7 +223,7 @@ FFMPEG_BIN=D:\tools\ffmpeg\bin\ffmpeg.exe
 ```text
 DeepSeek / OPENAI_MODEL      -> 文本讲解和问答
 Qwen-VL / VISION_MODEL       -> 图片识别，输出 artifact_id
-Paraformer / ASR_MODEL       -> 语音转文字，后续接
+Paraformer / ASR_MODEL       -> 语音转文字
 Qwen3-TTS / TTS_MODEL        -> 文字转语音，输出 ESP32 标准 WAV
 ```
 
@@ -442,6 +450,32 @@ AI_ENABLE_MOCK_TTS=false
 ```
 
 不需要配置 `TTS_BASE_URL`。如果真实 TTS 返回 MP3 或非 PCM WAV，建议安装 `ffmpeg`，或者在 `.env` 里设置 `FFMPEG_BIN`。
+
+完整模拟 ESP32 语音协议：
+
+```powershell
+.\.venv\Scripts\python.exe ai_wav_cli.py `
+  D:\path\to\request.wav `
+  --device walkie-01
+```
+
+`request.wav` 必须是设备同款格式：
+
+```text
+WAV / PCM / 16000 Hz / 16-bit / mono / little-endian
+```
+
+`ai_wav_cli.py` 会依次调用 `/ai/start`、`/ai/upload`、`/ai/finish`、`/ai/result_info`，如果 TTS 成功，还会调用 `/ai/result_chunk` 下载回复音频，默认保存到 `outputs/device_protocol/{device}/`。
+
+如果你手头暂时没有录音 WAV，可以先用真实 TTS 生成一句“这是什么”当测试输入：
+
+```powershell
+$env:AI_MOCK_LLM_TEXT = "这是什么"
+.\.venv\Scripts\python.exe local_text_ask_cli.py --device walkie-01 "生成测试请求音频"
+Remove-Item Env:\AI_MOCK_LLM_TEXT
+```
+
+然后把上一步输出的 `reply_wav_path` 作为 `ai_wav_cli.py` 的输入。这个方法只是本地联调用，真实设备会直接上传麦克风录到的 WAV。
 
 ## 手动 HTTP 测试
 
@@ -670,7 +704,7 @@ AI> 这是应国玉鹰……
 
 ### POST /ai/start
 
-ESP32 语音协议入口。当前后端已经实现协议骨架、分片保存、轮询状态、取消语义和 `result_chunk` 原始 WAV 返回。真实 ASR 还没有接入；TTS 已经通过 `tts.py` 接入，并统一输出 ESP32 标准 WAV。
+ESP32 语音协议入口。当前后端已经实现分片保存、ASR、LLM、TTS、轮询状态、取消语义和 `result_chunk` 原始 WAV 返回。设备端仍然只需要 HTTP POST；后端内部用 DashScope Paraformer 把 WAV 转成文字，再继续走现有问答和 TTS 链路。
 
 请求：
 
@@ -726,8 +760,9 @@ POST /ai/finish?session=abc123&device=walkie-02
 
 - 如果 WAV 无效，返回 `failed`。
 - 如果 WAV 太短或接近静音，返回 `no_speech`，`answer_text` 默认为“我没有听清，请再说一遍。”。
-- 如果没有配置 `AI_MOCK_ASR_TEXT`，有效语音也会暂时返回 `no_speech`，避免设备一直轮询。
-- 如果配置了 `AI_MOCK_ASR_TEXT`，后端会用这段文本调用现有 LLM 编排。
+- 有效语音会调用 `asr.py` 中的 DashScope Paraformer 识别，识别文本写入 `asr_text`。
+- 如果 ASR 配置错误或服务调用失败，返回 `failed`，并通过 `answer_text` 给设备一段可显示的错误提示，避免设备一直轮询。
+- 如果配置了 `AI_MOCK_ASR_TEXT`，后端会跳过真实 ASR，用这段文本调用现有 LLM 编排。
 - LLM 生成 `answer_text` 后，后端会异步调用 TTS，并把结果统一保存为 16k/16-bit/mono PCM WAV。
 - 如果 `AI_ENABLE_MOCK_TTS=true`，会跳过真实 TTS，生成一个符合设备格式的静音 WAV，用来测试 `result_chunk`。
 
@@ -1178,7 +1213,7 @@ $imageBytes = [System.IO.File]::ReadAllBytes("D:\test\artifact.jpg")
 - 没有前端页面
 - tool 是 mock 数据
 - memory 重启后丢失
-- `/ai/*` 已有设备协议骨架，但真实 ASR 尚未接入
+- `/ai/*` 的 session 仍保存在内存里，服务重启后会丢失
 - `AI_ENABLE_MOCK_TTS=true` 生成的是测试静音 WAV；关闭后才会调用真实 TTS
 
 这些限制是刻意保留的，目的是让这个项目作为最小学习版本，先看清 LLM 后端的基本骨架。
