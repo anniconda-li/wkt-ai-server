@@ -1,0 +1,363 @@
+# Minimal AI Chat Backend
+
+一个最小可运行的 AI 聊天后端示例，使用 Python 3.11、FastAPI 和 OpenAI-compatible API。
+
+当前版本已经支持：
+
+- `/chat` 聊天接口
+- 模型 streaming 输出
+- 最近 10 轮内存 memory
+- 简单 tool 调用机制
+- OpenAI / DeepSeek / 其他 OpenAI-compatible 服务商
+- Windows PowerShell 下的终端测试客户端
+
+项目没有引入 LangChain、Dify 等框架，代码量尽量少，方便学习后端调用 LLM 的基本链路。
+
+## 项目结构
+
+```text
+.
+├── main.py           # FastAPI app，定义 /health 和 /chat
+├── router.py         # 组装上下文、memory、tool 判断、流式转发
+├── llm.py            # 封装 OpenAI-compatible streaming 调用
+├── tools.py          # 示例 tool：get_device_status()
+├── chat_cli.py       # 终端聊天客户端，方便本地测试
+├── requirements.txt  # Python 依赖
+├── .env.example      # 环境变量示例，不放真实 key
+└── .gitignore        # 忽略 .env、.venv、缓存文件
+```
+
+## 实现流程
+
+一次聊天请求的完整流程：
+
+```text
+用户输入消息
+  -> main.py 接收 POST /chat
+  -> router.py 构造 messages
+  -> router.py 判断是否需要调用 tool
+  -> llm.py 调用模型 API，stream=True
+  -> router.py 一边转发 token，一边收集完整回复
+  -> main.py 使用 StreamingResponse 返回给客户端
+  -> router.py 把本轮 user/assistant 存入 memory
+```
+
+核心点：
+
+- `main.py` 负责 HTTP 接口。
+- `router.py` 负责业务编排。
+- `llm.py` 负责模型调用。
+- `tools.py` 负责外部工具能力。
+- `chat_cli.py` 只是测试客户端，不参与后端核心逻辑。
+
+## 环境准备
+
+本机推荐使用 `uv` 创建虚拟环境：
+
+```powershell
+cd D:\develop\Projects\AI-Box
+uv venv --python 3.11 .venv
+.\.venv\Scripts\Activate.ps1
+uv pip install -r requirements.txt
+```
+
+如果 `.venv` 已存在但不可用，可以删除后重新创建。
+
+## 配置模型
+
+复制或编辑 `.env`：
+
+```powershell
+notepad .env
+```
+
+DeepSeek 示例：
+
+```env
+OPENAI_API_KEY=your-deepseek-api-key
+OPENAI_MODEL=deepseek-v4-flash
+OPENAI_BASE_URL=https://api.deepseek.com
+```
+
+OpenAI 官方示例：
+
+```env
+OPENAI_API_KEY=your-openai-api-key
+OPENAI_MODEL=gpt-4o-mini
+# OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+说明：
+
+- `.env` 是本地私密配置，已经被 `.gitignore` 忽略。
+- `.env.example` 只放示例，不要写真实 key。
+- 如果修改了 `.env`，需要重启 uvicorn。
+
+## 启动后端
+
+```powershell
+cd D:\develop\Projects\AI-Box
+.\.venv\Scripts\python.exe -m uvicorn main:app --reload --env-file .env
+```
+
+看到类似输出说明启动成功：
+
+```text
+Uvicorn running on http://127.0.0.1:8000
+```
+
+健康检查：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+```
+
+正常返回：
+
+```json
+{"status":"ok"}
+```
+
+## 推荐测试方式
+
+Windows PowerShell 手写 JSON 很容易遇到中文编码和引号转义问题，所以推荐使用内置终端客户端：
+
+```powershell
+cd D:\develop\Projects\AI-Box
+.\.venv\Scripts\python.exe chat_cli.py
+```
+
+进入后直接输入：
+
+```text
+Terminal chat client. Type /exit to quit.
+
+You> 你好，你是谁呀？
+AI> 你好呀！我是 ...
+
+You> 我叫李庆博，请记住我的名字
+AI> 好的 ...
+
+You> 你还记得我叫什么吗？
+AI> 当然记得，你叫李庆博 ...
+```
+
+退出：
+
+```text
+You> /exit
+```
+
+也可以单次调用：
+
+```powershell
+.\.venv\Scripts\python.exe chat_cli.py "what is the device status?"
+```
+
+## 手动 HTTP 测试
+
+如果想直接用 PowerShell 调接口，推荐强制 UTF-8：
+
+```powershell
+$msg = Read-Host "请输入消息"
+$json = @{ message = $msg } | ConvertTo-Json -Compress
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+
+Invoke-RestMethod `
+  -Uri "http://127.0.0.1:8000/chat" `
+  -Method POST `
+  -ContentType "application/json; charset=utf-8" `
+  -Body $bytes
+```
+
+如果使用 `curl.exe`，Windows PowerShell 可以用 `--%` 停止后续参数解析：
+
+```powershell
+curl.exe --% -N -X POST http://127.0.0.1:8000/chat -H "Content-Type: application/json" --data-raw "{\"message\":\"hello\"}"
+```
+
+## API
+
+### GET /health
+
+健康检查。
+
+返回：
+
+```json
+{"status":"ok"}
+```
+
+### POST /chat
+
+聊天接口，返回 `text/plain` 流式文本。
+
+请求：
+
+```json
+{
+  "message": "hello"
+}
+```
+
+响应：
+
+```text
+Hello! How can I help you today?
+```
+
+## Memory 实现
+
+`router.py` 中有一个进程内 list：
+
+```python
+memory: list[dict[str, str]] = []
+```
+
+每次模型完整回复结束后，会保存：
+
+- 当前用户消息
+- 当前助手回复
+
+最多保留最近 10 轮，也就是 20 条 message：
+
+```python
+del memory[:-MAX_MEMORY_ROUNDS * 2]
+```
+
+注意：
+
+- memory 只在当前 Python 进程内有效。
+- 重启服务后 memory 会清空。
+- 当前版本没有多用户隔离，所有请求共享同一个 memory。
+
+## Tool 调用实现
+
+`router.py` 中通过简单 if/else 判断是否需要调用 tool：
+
+```python
+def should_call_tool(user_message: str) -> bool:
+    text = user_message.lower()
+    return "status" in text or "device" in text
+```
+
+当用户消息包含 `status` 或 `device` 时，会调用：
+
+```python
+get_device_status()
+```
+
+`tools.py` 目前返回模拟设备状态：
+
+```json
+{
+  "device_id": "esp32-demo-001",
+  "device_type": "ESP32",
+  "online": true,
+  "temperature_c": 26.8,
+  "humidity_percent": 47.2
+}
+```
+
+这个例子的重点不是 ESP32 本身，而是演示：
+
+```text
+用户问题 -> 后端调用外部工具 -> 把工具结果拼进 LLM 上下文 -> 模型用自然语言回答
+```
+
+以后可以把这个 tool 换成：
+
+- 查询数据库
+- 查询订单状态
+- 查询真实设备
+- 调用公司内部 API
+- 搜索知识库
+
+## Streaming 实现
+
+`llm.py` 中开启 streaming：
+
+```python
+stream = await client.chat.completions.create(
+    model=get_model(),
+    messages=messages,
+    stream=True,
+    temperature=0.7,
+)
+```
+
+然后逐块读取模型厂商返回的 chunk：
+
+```python
+async for chunk in stream:
+    token = chunk.choices[0].delta.content
+    if token:
+        yield token
+```
+
+`main.py` 使用 FastAPI 的 `StreamingResponse` 把这些 token 转发给客户端：
+
+```python
+return StreamingResponse(
+    chat_stream(user_message),
+    media_type="text/plain; charset=utf-8",
+)
+```
+
+所以流式输出的本质是：
+
+```text
+模型厂商分块返回 -> 后端分块接收 -> 后端分块转发给客户端
+```
+
+## 常见问题
+
+### 1. POST /chat 返回 JSON decode error
+
+通常是 PowerShell 中 JSON 引号被转义坏了。推荐使用：
+
+```powershell
+.\.venv\Scripts\python.exe chat_cli.py
+```
+
+或者使用上面的 UTF-8 `Invoke-RestMethod` 示例。
+
+### 2. 中文变成问号或乱码
+
+这是 Windows PowerShell 5.1 常见编码问题。手动请求时把 body 转成 UTF-8 bytes：
+
+```powershell
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+```
+
+终端客户端 `chat_cli.py` 已经处理了 UTF-8。
+
+### 3. LLM_ERROR APITimeoutError
+
+说明后端收到了请求，但连接模型 API 超时。检查：
+
+- `.env` 是否在项目目录 `D:\develop\Projects\AI-Box`
+- `OPENAI_API_KEY` 是否是真实 key
+- `OPENAI_BASE_URL` 是否正确
+- 当前网络是否能访问模型服务商
+- 修改 `.env` 后是否重启了 uvicorn
+
+### 4. 修改 .env 后不生效
+
+重启 uvicorn：
+
+```powershell
+Ctrl+C
+.\.venv\Scripts\python.exe -m uvicorn main:app --reload --env-file .env
+```
+
+## 当前限制
+
+- 没有数据库
+- 没有用户登录
+- 没有多用户 memory 隔离
+- 没有前端页面
+- tool 是 mock 数据
+- memory 重启后丢失
+
+这些限制是刻意保留的，目的是让这个项目作为最小学习版本，先看清 LLM 后端的基本骨架。
