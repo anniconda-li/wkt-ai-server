@@ -253,7 +253,7 @@ Invoke-RestMethod -Method POST http://127.0.0.1:8000/sessions/walkie-01/clear
 Invoke-RestMethod http://127.0.0.1:8000/artifacts
 ```
 
-当前种子卡片包含：
+当前知识卡包含：
 
 - `yingguo_jade_eagle`：应国玉鹰
 - `bronze_he_dragon_knob_lidded`：盘龙钮带盖铜盉
@@ -277,15 +277,22 @@ Invoke-RestMethod http://127.0.0.1:8000/artifacts/yingguo_jade_eagle
 {
   "id": "yingguo_jade_eagle",
   "name": "应国玉鹰",
-  "aliases": ["玉鹰", "应国鹰形玉器"],
+  "aliases": ["玉鹰", "白玉线雕鹰", "应国鹰形玉器"],
   "category": "玉器",
-  "period": "待景区资料确认",
-  "material": "玉",
-  "visual_keywords": ["鹰形", "鸟形", "玉质"],
-  "recognition_features": ["整体呈鹰或鸟的造型"],
-  "facts": ["待景区资料确认"],
-  "guide_notes": ["讲解建议"],
-  "data_status": "seed"
+  "period": "西周晚期",
+  "material": "白玉",
+  "visual_keywords": ["鹰形", "鸟形", "白玉", "线雕"],
+  "recognition_features": ["整体呈鹰展翅飞翔状"],
+  "facts": ["应国玉鹰又称白玉线雕鹰，是西周晚期玉器。"],
+  "guide_notes": ["后端维护用讲解提示，不直接传给模型"],
+  "source_note": "公开网络资料补充，后续仍建议用馆方正式资料复核展陈口径。",
+  "source_urls": [
+    {
+      "title": "平顶山博物馆文物解码",
+      "url": "https://www.news.cn/shuhua/20211116/a840ac11f5d243ccb34457ef307d8ae8/c.html"
+    }
+  ],
+  "data_status": "public_web_enriched"
 }
 ```
 
@@ -296,7 +303,19 @@ Invoke-RestMethod http://127.0.0.1:8000/artifacts/yingguo_jade_eagle
 LLM 只负责把已知事实组织成讲解语言
 ```
 
-当前卡片是种子数据，只用于搭建结构。具体年代、出土信息、历史故事、展陈说明等事实，后续应该替换为景区提供的权威资料。注意：传给模型的事实文本必须是游客可接受的表达，不要出现“种子数据卡”“内部配置”“讲解时可以”这类工程或运营内部措辞。
+当前卡片已经根据公开网络资料做了第一轮补充，主要参考新华网/人民日报的《平顶山博物馆文物解码》和河南省文物局页面。后续做正式景区项目时，仍建议用馆方正式资料复核展陈口径。
+
+字段分层很重要：
+
+- `facts`：会传给 LLM，是游客可以直接听到的事实。
+- `visual_keywords` 和 `recognition_features`：后续图像识别和本地匹配会用到。
+- `guide_notes`：后端维护用提示，当前不会传给模型。
+- `source_urls` 和 `source_note`：资料溯源和复核提示，当前不会传给模型。
+- `data_status`：标记资料状态，例如 `public_web_enriched`。
+
+注意：传给模型的事实文本必须是游客可接受的表达，不要出现“种子数据卡”“内部配置”“讲解时可以”这类工程或运营内部措辞。
+
+如果修改了 `data/artifacts/*.json`，当前建议重启 uvicorn。因为 `artifacts.py` 使用 `lru_cache` 缓存知识卡，重启后才会重新加载 JSON。
 
 当用户消息中明确提到某件文物名称或别名时，`router.py` 会把匹配到的知识卡加入 LLM 上下文。例如用户问：
 
@@ -472,7 +491,7 @@ Ctrl+C
 
 - 没有数据库
 - 没有用户登录
-- 没有多用户 memory 隔离
+- 没有持久化用户系统
 - 没有前端页面
 - tool 是 mock 数据
 - memory 重启后丢失
