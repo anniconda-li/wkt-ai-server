@@ -2,6 +2,7 @@ import json
 import logging
 from typing import AsyncIterator
 
+from artifacts import find_artifacts_by_text
 from llm import stream_chat_completion
 from sessions import DeviceSession, get_session, remember_turn
 from tools import get_device_status
@@ -23,6 +24,18 @@ def should_call_tool(user_message: str) -> bool:
 def build_messages(user_message: str, session: DeviceSession) -> list[dict[str, str]]:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(session.memory)
+
+    artifact_matches = find_artifacts_by_text(user_message)
+    if artifact_matches:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Local artifact knowledge cards matched by the user message:\n"
+                    f"{json.dumps(artifact_matches, ensure_ascii=False)}"
+                ),
+            }
+        )
 
     if should_call_tool(user_message):
         tool_result = get_device_status()

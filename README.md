@@ -7,6 +7,7 @@
 - `/chat` 聊天接口
 - 模型 streaming 输出
 - 按设备隔离的最近 10 轮内存 memory
+- 本地文物知识卡查询
 - 简单 tool 调用机制
 - OpenAI / DeepSeek / 其他 OpenAI-compatible 服务商
 - Windows PowerShell 下的终端测试客户端
@@ -20,8 +21,10 @@
 ├── main.py           # FastAPI app，定义 /health 和 /chat
 ├── router.py         # 组装上下文、memory、tool 判断、流式转发
 ├── sessions.py       # 按 device_id 管理设备会话和 memory
+├── artifacts.py      # 加载本地文物知识卡
 ├── llm.py            # 封装 OpenAI-compatible streaming 调用
 ├── tools.py          # 示例 tool：get_device_status()
+├── data/artifacts/   # 5 件核心文物的本地 JSON 知识卡
 ├── chat_cli.py       # 终端聊天客户端，方便本地测试
 ├── requirements.txt  # Python 依赖
 ├── .env.example      # 环境变量示例，不放真实 key
@@ -37,6 +40,7 @@
   -> main.py 接收 POST /chat
   -> sessions.py 获取该 device 的会话
   -> router.py 构造 messages
+  -> router.py 如果识别到文物名称，则加入本地知识卡
   -> router.py 判断是否需要调用 tool
   -> llm.py 调用模型 API，stream=True
   -> router.py 一边转发 token，一边收集完整回复
@@ -49,6 +53,7 @@
 - `main.py` 负责 HTTP 接口。
 - `router.py` 负责业务编排。
 - `sessions.py` 负责设备上下文和短期记忆。
+- `artifacts.py` 负责加载和查询本地文物知识卡。
 - `llm.py` 负责模型调用。
 - `tools.py` 负责外部工具能力。
 - `chat_cli.py` 只是测试客户端，不参与后端核心逻辑。
@@ -239,6 +244,67 @@ Invoke-RestMethod http://127.0.0.1:8000/sessions/walkie-01
 ```powershell
 Invoke-RestMethod -Method POST http://127.0.0.1:8000/sessions/walkie-01/clear
 ```
+
+### GET /artifacts
+
+查看本地文物知识卡列表。
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/artifacts
+```
+
+当前种子卡片包含：
+
+- `yingguo_jade_eagle`：应国玉鹰
+- `bronze_he_dragon_knob_lidded`：盘龙钮带盖铜盉
+- `denggong_gui`：邓公簋
+- `black_glaze_blue_splash_tripod_washer`：黑釉蓝斑花口三足洗
+- `shuyao_chuilin_sheng_ding`：束腰垂鳞纹升鼎
+
+### GET /artifacts/{artifact_id}
+
+查看某件文物的完整知识卡。
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/artifacts/yingguo_jade_eagle
+```
+
+## 本地文物知识卡
+
+文物资料放在 `data/artifacts/*.json` 中。每张卡片目前包含：
+
+```json
+{
+  "id": "yingguo_jade_eagle",
+  "name": "应国玉鹰",
+  "aliases": ["玉鹰", "应国鹰形玉器"],
+  "category": "玉器",
+  "period": "待景区资料确认",
+  "material": "玉",
+  "visual_keywords": ["鹰形", "鸟形", "玉质"],
+  "recognition_features": ["整体呈鹰或鸟的造型"],
+  "facts": ["待景区资料确认"],
+  "guide_notes": ["讲解建议"],
+  "data_status": "seed"
+}
+```
+
+这一层的设计目的：
+
+```text
+把文物事实掌握在后端
+LLM 只负责把已知事实组织成讲解语言
+```
+
+当前卡片是种子数据，只用于搭建结构。具体年代、出土信息、历史故事、展陈说明等事实，后续应该替换为景区提供的权威资料。
+
+当用户消息中明确提到某件文物名称或别名时，`router.py` 会把匹配到的知识卡加入 LLM 上下文。例如用户问：
+
+```text
+讲讲应国玉鹰
+```
+
+后端会匹配 `应国玉鹰`，并把 `yingguo_jade_eagle` 的知识卡拼进 messages。后续接入图像识别后，识别出的 `latest_artifact_id` 也会走同一套知识卡。
 
 ## Memory 实现
 

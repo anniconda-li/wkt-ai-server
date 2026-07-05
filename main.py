@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from artifacts import ArtifactNotFoundError, get_artifact, list_artifacts
 from llm import validate_llm_config
 from router import chat_stream
 from sessions import clear_session, list_session_summaries, normalize_device_id, session_snapshot
@@ -23,6 +24,19 @@ async def health() -> dict[str, str]:
 @app.get("/sessions")
 async def sessions() -> list[dict[str, object]]:
     return list_session_summaries()
+
+
+@app.get("/artifacts")
+async def artifacts() -> list[dict[str, object]]:
+    return list_artifacts()
+
+
+@app.get("/artifacts/{artifact_id}")
+async def artifact_detail(artifact_id: str) -> dict[str, object]:
+    try:
+        return get_artifact(artifact_id)
+    except ArtifactNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="artifact not found") from exc
 
 
 @app.get("/sessions/{device_id}")
