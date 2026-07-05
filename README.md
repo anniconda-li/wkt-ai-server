@@ -183,19 +183,27 @@ ASR_PROVIDER=dashscope
 ASR_MODEL=paraformer-realtime-v2
 
 TTS_PROVIDER=dashscope
+TTS_API_STYLE=dashscope_qwen
 TTS_MODEL=qwen3-tts-flash
 TTS_VOICE=Cherry
-TTS_RESPONSE_FORMAT=wav
+TTS_LANGUAGE_TYPE=Chinese
+TTS_BASE_URL=https://你的-workspace-id.cn-beijing.maas.aliyuncs.com/api/v1
 TTS_TIMEOUT_SECONDS=120
 ```
 
-一般不需要单独写 `TTS_API_KEY` 或 `TTS_BASE_URL`，默认复用 `DASHSCOPE_API_KEY` 和 `DASHSCOPE_BASE_URL`。当前 TTS 默认请求：
+`TTS_API_KEY` 默认复用 `DASHSCOPE_API_KEY`。但 `TTS_BASE_URL` 不能复用 `DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1`，Qwen3-TTS 需要百炼业务空间的 `api/v1` 地址，例如：
 
 ```text
-{DASHSCOPE_BASE_URL}/audio/speech
+https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1
 ```
 
-如果服务商路径不同，可以用 `TTS_ENDPOINT` 完整覆盖。
+当前 TTS 默认请求：
+
+```text
+{TTS_BASE_URL}/services/aigc/multimodal-generation/generation
+```
+
+如果服务商路径不同，可以用 `TTS_ENDPOINT` 完整覆盖。百炼官方文档的 Qwen-TTS 非流式输出会先返回音频 URL，后端会下载这个 URL，再统一转成 ESP32 要的 16k/16-bit/mono PCM WAV。
 
 当前分工：
 
@@ -421,6 +429,15 @@ AI_ENABLE_MOCK_TTS=true
 ```
 
 这会生成符合设备格式的静音 WAV，只用于测试文件格式和分片读取，不代表真实语音合成效果。
+
+如果要测试真实 TTS，请确保 `.env` 里是：
+
+```env
+AI_ENABLE_MOCK_TTS=false
+TTS_BASE_URL=https://你的-workspace-id.cn-beijing.maas.aliyuncs.com/api/v1
+```
+
+`TTS_BASE_URL` 必须是百炼业务空间地址，不能是 `https://dashscope.aliyuncs.com/compatible-mode/v1`。
 
 ## 手动 HTTP 测试
 
