@@ -659,6 +659,31 @@ Ctrl+C
 .\.venv\Scripts\python.exe -m uvicorn main:app --reload --env-file .env
 ```
 
+### 5. uploads 里的图片打不开
+
+正常通过 `/camera/upload` 上传的文件应该能作为普通 `.jpg` 打开。如果打不开，通常说明保存进去的 body 不是完整 JPEG。
+
+检查文件大小：
+
+```powershell
+Get-ChildItem -Recurse uploads | Select-Object FullName,Length
+```
+
+如果只有十几字节，基本就是测试时写入的假图片，或者请求 body 不是图片字节。当前接口已经检查：
+
+- `Content-Type` 必须是 `image/jpeg`
+- 文件大小不能太小
+- 文件必须有 JPEG 开头 `FF D8 FF`
+- 文件必须有 JPEG 结束标记 `FF D9`
+
+PowerShell 上传时要用：
+
+```powershell
+$imageBytes = [System.IO.File]::ReadAllBytes("D:\test\artifact.jpg")
+```
+
+不要把图片路径字符串、Base64 文本、JSON 或普通字符串当成 body 发给 `/camera/upload`。
+
 ## 当前限制
 
 - 没有数据库

@@ -7,6 +7,7 @@ from uuid import uuid4
 
 UPLOADS_DIR = Path(__file__).parent / "uploads"
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MIN_JPEG_BYTES = 128
 SUPPORTED_IMAGE_CONTENT_TYPES = {
     "image/jpeg",
     "image/jpg",
@@ -35,8 +36,12 @@ def validate_jpeg_upload(image_bytes: bytes, content_type: str | None) -> str:
         raise CameraUploadError("image body cannot be empty")
     if len(image_bytes) > MAX_IMAGE_BYTES:
         raise CameraUploadError("image is too large")
-    if not image_bytes.startswith(b"\xff\xd8"):
+    if len(image_bytes) < MIN_JPEG_BYTES:
+        raise CameraUploadError("image is too small to be a complete JPEG")
+    if not image_bytes.startswith(b"\xff\xd8\xff"):
         raise CameraUploadError("uploaded file is not a JPEG image")
+    if not image_bytes.endswith(b"\xff\xd9"):
+        raise CameraUploadError("JPEG image appears to be incomplete")
     return normalized_content_type
 
 
