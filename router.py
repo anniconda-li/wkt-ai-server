@@ -2,7 +2,7 @@ import json
 import logging
 from typing import AsyncIterator
 
-from artifacts import find_artifacts_by_text, to_llm_context
+from artifacts import ArtifactNotFoundError, find_artifacts_by_text, get_artifact, to_llm_context
 from llm import stream_chat_completion
 from sessions import DeviceSession, get_session, remember_turn
 from tools import get_device_status
@@ -20,17 +20,63 @@ SYSTEM_PROMPT = (
 
 logger = logging.getLogger(__name__)
 
+FOLLOW_UP_TRIGGERS = (
+    "它",
+    "他",
+    "这件",
+    "这个",
+    "那个",
+    "刚才",
+    "上一件",
+    "继续",
+    "接着",
+    "再讲",
+    "为什么",
+    "意义",
+    "故事",
+    "用途",
+    "年代",
+    "出土",
+    "材料",
+    "纹饰",
+    "特点",
+    "重要",
+    "有什么",
+)
+
 
 def should_call_tool(user_message: str) -> bool:
     text = user_message.lower()
     return "status" in text or "device" in text
 
 
+def looks_like_artifact_follow_up(user_message: str) -> bool:
+    return any(trigger in user_message for trigger in FOLLOW_UP_TRIGGERS)
+
+
+def resolve_artifact_context(
+    user_message: str, session: DeviceSession
+) -> list[dict[str, object]]:
+    artifact_matches = find_artifacts_by_text(user_message)
+    if artifact_matches:
+        session.latest_artifact_id = str(artifact_matches[0]["id"])
+        return artifact_matches
+
+    if session.latest_artifact_id and looks_like_artifact_follow_up(user_message):
+        try:
+            return [get_artifact(session.latest_artifact_id)]
+        except ArtifactNotFoundError:
+            logger.warning("Latest artifact no longer exists: %s", session.latest_artifact_id)
+            session.latest_artifact_id = None
+
+    return []
+
+
 def build_messages(user_message: str, session: DeviceSession) -> list[dict[str, str]]:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(session.memory)
 
-    artifact_matches = find_artifacts_by_text(user_message)
+    artifact_matches = resolve_artifact_context(user_message, session)
     if artifact_matches:
         artifact_context = [to_llm_context(artifact) for artifact in artifact_matches]
         messages.append(

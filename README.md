@@ -8,6 +8,7 @@
 - 模型 streaming 输出
 - 按设备隔离的最近 10 轮内存 memory
 - 本地文物知识卡查询
+- 文物追问上下文继承
 - 简单 tool 调用机制
 - OpenAI / DeepSeek / 其他 OpenAI-compatible 服务商
 - Windows PowerShell 下的终端测试客户端
@@ -41,6 +42,7 @@
   -> sessions.py 获取该 device 的会话
   -> router.py 构造 messages
   -> router.py 如果识别到文物名称，则加入本地知识卡
+  -> router.py 如果是“它/这件/继续讲”等追问，则继承该设备上一件文物
   -> router.py 判断是否需要调用 tool
   -> llm.py 调用模型 API，stream=True
   -> router.py 一边转发 token，一边收集完整回复
@@ -325,6 +327,16 @@ LLM 只负责把已知事实组织成讲解语言
 
 后端会匹配 `应国玉鹰`，并把 `yingguo_jade_eagle` 的知识卡拼进 messages。后续接入图像识别后，识别出的 `latest_artifact_id` 也会走同一套知识卡。
 
+当用户明确提到某件文物时，`router.py` 会把该文物 id 保存到当前设备的 `session.latest_artifact_id`。如果下一轮用户没有再说文物名，而是问：
+
+```text
+它对平顶山市有什么重要意义吗？
+继续讲讲它的故事
+这件东西是做什么用的？
+```
+
+后端会判断这类句子像追问，并把 `latest_artifact_id` 对应的知识卡再次加入 LLM 上下文。这样回答不是单纯依赖上一轮 assistant 的文本记忆，而是明确继承“当前设备正在看的那件文物”。
+
 回答生成有一个重要约束：模型输出就是设备端直接展示给游客的内容。因此 prompt 明确要求模型不要输出“讲解时可以这样带”“你可以引导游客观察”这类内部指导语，而是直接生成游客可听可看的讲解文本。知识卡里的 `guide_notes` 只作为后端维护资料保留，当前不会传给模型，避免模型把内部讲解建议原样说给游客。
 
 ## Memory 实现
@@ -365,6 +377,7 @@ del session.memory[:-MAX_MEMORY_ROUNDS * 2]
 - memory 只在当前 Python 进程内有效。
 - 重启服务后 memory 会清空。
 - 当前版本已经按 `device_id` 隔离 memory。
+- `latest_artifact_id` 也按 `device_id` 隔离，用来承接“它/这件/继续讲”等文物追问。
 - 后续接 ESP32 时，`walkie-01`、`walkie-02` 应该各自使用自己的 device id。
 
 ## Tool 调用实现
