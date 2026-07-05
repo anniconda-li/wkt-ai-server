@@ -7,10 +7,10 @@ from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
 
-from llm import validate_llm_config
-from router import chat_response
+from pipeline import generate_answer_text
 from sessions import normalize_device_id
-from wav_utils import WavFormatError, looks_like_silence, validate_device_wav, write_silence_wav
+from tts import synthesize_to_device_wav
+from wav_utils import WavFormatError, looks_like_silence, validate_device_wav
 
 
 AI_CHUNK_SIZE = 8192
@@ -69,13 +69,6 @@ def now_iso() -> str:
 
 def elapsed_ms(start: float) -> float:
     return (perf_counter() - start) * 1000
-
-
-def env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def create_ai_session(device: str | None, language: str | None = "zh") -> AiSession:
@@ -348,25 +341,10 @@ async def run_llm_stage(session: AiSession) -> None:
     start = perf_counter()
     set_status(session, "llm_running")
 
-    mock_answer = os.getenv("AI_MOCK_LLM_TEXT", "").strip()
-    if mock_answer:
-        session.answer_text = mock_answer
-        session.tts_status = "pending"
-        set_status(session, "text_ready")
-        logger.info(
-            "ai.llm.mock_done session=%s answer_chars=%d ms=%.1f",
-            session.session_id,
-            len(mock_answer),
-            elapsed_ms(start),
-        )
-        return
-
-    validate_llm_config()
-
     answer = (
-        await chat_response(
-            session.asr_text,
+        await generate_answer_text(
             session.device_id,
+            session.asr_text,
             should_continue=lambda: not session.cancel_requested,
         )
     ).strip()
@@ -400,18 +378,35 @@ async def run_tts_stage(session: AiSession) -> None:
     session.tts_status = "running"
     set_status(session, "tts_running")
 
-    if not env_bool("AI_ENABLE_MOCK_TTS", default=False):
-        session.tts_status = "failed"
-        session.tts_error = "TTS is not implemented yet"
-        set_status(session, "audio_failed")
-        logger.info("ai.tts.skipped session=%s ms=%.1f", session.session_id, elapsed_ms(start))
-        return
-
     if session.reply_wav_path is None:
         raise RuntimeError("reply WAV path missing")
 
-    duration = float(os.getenv("AI_MOCK_TTS_SECONDS", "0.4"))
-    write_silence_wav(session.reply_wav_path, duration)
+    try:
+        await asyncio.to_thread(
+            synthesize_to_device_wav,
+            session.answer_text,
+            session.reply_wav_path,
+        )
+    except Exception as exc:
+        session.tts_status = "failed"
+        session.tts_error = str(exc)
+        set_status(session, "audio_failed")
+        logger.info(
+            "ai.tts.failed session=%s error=%s ms=%.1f",
+            session.session_id,
+            exc,
+            elapsed_ms(start),
+        )
+        return
+
+    if session.cancel_requested:
+        set_status(session, "cancelled")
+        return
+    if session.audio_stopped:
+        session.tts_status = "stopped"
+        set_status(session, "text_ready")
+        return
+
     reply_size = session.reply_wav_path.stat().st_size
     if reply_size > AI_MAX_REPLY_WAV_BYTES:
         raise RuntimeError("reply WAV exceeds maximum size")

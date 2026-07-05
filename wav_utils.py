@@ -1,5 +1,7 @@
+import audioop
 import math
 import sys
+import tempfile
 import wave
 from array import array
 from pathlib import Path
@@ -74,3 +76,59 @@ def write_silence_wav(path: Path, duration_seconds: float = 0.4) -> None:
         wav_file.setsampwidth(WAV_SAMPLE_WIDTH)
         wav_file.setframerate(WAV_SAMPLE_RATE)
         wav_file.writeframes(silence)
+
+
+def convert_wav_to_device_format(source_path: Path, target_path: Path) -> dict[str, int | float]:
+    try:
+        with wave.open(str(source_path), "rb") as source:
+            channels = source.getnchannels()
+            sample_width = source.getsampwidth()
+            frame_rate = source.getframerate()
+            compression = source.getcomptype()
+            frames = source.readframes(source.getnframes())
+    except (EOFError, wave.Error) as exc:
+        raise WavFormatError(f"invalid WAV file: {exc}") from exc
+
+    if compression != "NONE":
+        raise WavFormatError("WAV must use PCM encoding")
+    if channels == 2:
+        frames = audioop.tomono(frames, sample_width, 0.5, 0.5)
+        channels = 1
+    elif channels != 1:
+        raise WavFormatError("only mono or stereo WAV can be converted")
+
+    if sample_width != WAV_SAMPLE_WIDTH:
+        frames = audioop.lin2lin(frames, sample_width, WAV_SAMPLE_WIDTH)
+        sample_width = WAV_SAMPLE_WIDTH
+
+    if frame_rate != WAV_SAMPLE_RATE:
+        frames, _ = audioop.ratecv(
+            frames,
+            sample_width,
+            channels,
+            frame_rate,
+            WAV_SAMPLE_RATE,
+            None,
+        )
+        frame_rate = WAV_SAMPLE_RATE
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        suffix=".wav",
+        dir=str(target_path.parent),
+        delete=False,
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
+
+    try:
+        with wave.open(str(temp_path), "wb") as target:
+            target.setnchannels(WAV_CHANNELS)
+            target.setsampwidth(WAV_SAMPLE_WIDTH)
+            target.setframerate(WAV_SAMPLE_RATE)
+            target.writeframes(frames)
+        temp_path.replace(target_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+    return validate_device_wav(target_path)
