@@ -1,6 +1,8 @@
 import base64
 import json
+import logging
 import os
+from time import perf_counter
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -15,6 +17,7 @@ DEFAULT_VISION_MODEL = "qwen-vl-plus"
 UNKNOWN_ARTIFACT_ID = "unknown"
 
 _vision_client: AsyncOpenAI | None = None
+logger = logging.getLogger(__name__)
 
 
 class VisionConfigError(RuntimeError):
@@ -36,6 +39,8 @@ def get_vision_model() -> str:
 def get_vision_base_url() -> str:
     if os.getenv("VISION_BASE_URL"):
         return os.environ["VISION_BASE_URL"].strip()
+    if os.getenv("DASHSCOPE_BASE_URL"):
+        return os.environ["DASHSCOPE_BASE_URL"].strip()
     if get_vision_provider() == "dashscope":
         return DASHSCOPE_BASE_URL
     return ""
@@ -77,6 +82,10 @@ def get_vision_client() -> AsyncOpenAI:
             base_url=get_vision_base_url(),
         )
     return _vision_client
+
+
+def elapsed_ms(start: float) -> float:
+    return (perf_counter() - start) * 1000
 
 
 def image_to_data_url(image_bytes: bytes, content_type: str | None) -> str:
@@ -206,8 +215,22 @@ async def recognize_artifact_from_image(
     image_bytes: bytes,
     content_type: str | None,
 ) -> dict[str, object]:
+    total_start = perf_counter()
     client = get_vision_client()
+    candidates_start = perf_counter()
     candidates = build_vision_candidates()
+    logger.info(
+        "vision.recognition.start provider=%s model=%s image_bytes=%d candidates=%d",
+        get_vision_provider(),
+        get_vision_model(),
+        len(image_bytes),
+        len(candidates),
+    )
+    logger.info(
+        "vision.recognition.stage build_candidates_ms=%.1f",
+        elapsed_ms(candidates_start),
+    )
+    api_start = perf_counter()
     try:
         response = await client.chat.completions.create(
             model=get_vision_model(),
@@ -229,10 +252,26 @@ async def recognize_artifact_from_image(
         raise VisionRecognitionError(
             f"vision model call failed: {type(exc).__name__}: {exc}"
         ) from exc
+    logger.info("vision.recognition.stage api_call_ms=%.1f", elapsed_ms(api_start))
 
     if not response.choices:
         raise VisionRecognitionError("vision model returned no choices")
 
+    parse_start = perf_counter()
     text = message_content_to_text(response.choices[0].message.content)
     raw_result = extract_json_object(text)
-    return normalize_vision_result(raw_result)
+    result = normalize_vision_result(raw_result)
+    logger.info(
+        "vision.recognition.stage parse_result_ms=%.1f predicted_artifact_id=%s "
+        "accepted=%s confidence=%s",
+        elapsed_ms(parse_start),
+        result.get("predicted_artifact_id"),
+        result.get("accepted"),
+        result.get("confidence"),
+    )
+    logger.info(
+        "vision.recognition.done artifact_id=%s total_ms=%.1f",
+        result.get("artifact_id"),
+        elapsed_ms(total_start),
+    )
+    return result

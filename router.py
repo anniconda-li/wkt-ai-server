@@ -1,5 +1,6 @@
 import json
 import logging
+from time import perf_counter
 from typing import AsyncIterator
 
 from artifacts import ArtifactNotFoundError, find_artifacts_by_text, get_artifact, to_llm_context
@@ -125,17 +126,67 @@ def build_messages(user_message: str, session: DeviceSession) -> list[dict[str, 
     return messages
 
 
+def elapsed_ms(start: float) -> float:
+    return (perf_counter() - start) * 1000
+
+
 async def chat_stream(user_message: str, device_id: str) -> AsyncIterator[str]:
+    total_start = perf_counter()
     session = get_session(device_id)
     chunks: list[str] = []
+    logger.info(
+        "chat.start device=%s input_chars=%d memory_messages=%d latest_artifact_id=%s",
+        device_id,
+        len(user_message),
+        len(session.memory),
+        session.latest_artifact_id,
+    )
+
+    build_start = perf_counter()
+    messages = build_messages(user_message, session)
+    logger.info(
+        "chat.stage build_messages_ms=%.1f device=%s messages=%d latest_artifact_id=%s",
+        elapsed_ms(build_start),
+        device_id,
+        len(messages),
+        session.latest_artifact_id,
+    )
 
     try:
-        async for token in stream_chat_completion(build_messages(user_message, session)):
+        stream_start = perf_counter()
+        first_token_seen = False
+        async for token in stream_chat_completion(messages):
+            if not first_token_seen:
+                first_token_seen = True
+                logger.info(
+                    "chat.stage first_token_ms=%.1f device=%s",
+                    elapsed_ms(stream_start),
+                    device_id,
+                )
             chunks.append(token)
             yield token
     except Exception as exc:
-        logger.exception("LLM streaming failed")
+        logger.exception(
+            "chat.failed device=%s error=%s total_ms=%.1f",
+            device_id,
+            type(exc).__name__,
+            elapsed_ms(total_start),
+        )
         yield f"\n[LLM_ERROR] {type(exc).__name__}: {exc}\n"
         return
 
-    remember_turn(session, user_message, "".join(chunks))
+    remember_start = perf_counter()
+    assistant_message = "".join(chunks)
+    remember_turn(session, user_message, assistant_message)
+    logger.info(
+        "chat.stage remember_turn_ms=%.1f device=%s memory_messages=%d",
+        elapsed_ms(remember_start),
+        device_id,
+        len(session.memory),
+    )
+    logger.info(
+        "chat.done device=%s output_chars=%d total_ms=%.1f",
+        device_id,
+        len(assistant_message),
+        elapsed_ms(total_start),
+    )

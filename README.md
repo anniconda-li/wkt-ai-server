@@ -107,28 +107,35 @@ uv pip install -r requirements.txt
 notepad .env
 ```
 
-DeepSeek 示例：
+DeepSeek 文本讲解模型：
 
 ```env
 OPENAI_API_KEY=your-deepseek-api-key
 OPENAI_MODEL=deepseek-v4-flash
 OPENAI_BASE_URL=https://api.deepseek.com
+LOG_LEVEL=INFO
 ```
 
-百炼视觉识别示例：
+百炼统一配置。视觉识别、后续 ASR、后续 TTS 可以共用这一个 key：
+
+```env
+DASHSCOPE_API_KEY=your-dashscope-api-key
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+```
+
+百炼视觉识别：
 
 ```env
 VISION_PROVIDER=dashscope
 VISION_MODEL=qwen-vl-plus
-VISION_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-VISION_API_KEY=your-dashscope-api-key
 VISION_MIN_CONFIDENCE=0.60
 ```
 
-如果你习惯用 `DASHSCOPE_API_KEY`，也可以这样写：
+一般不需要单独写 `VISION_API_KEY` 或 `VISION_BASE_URL`，它们会默认复用 `DASHSCOPE_API_KEY` 和 `DASHSCOPE_BASE_URL`。只有当视觉模型想换到另一个服务商或另一个百炼 endpoint 时，才需要覆盖：
 
 ```env
-DASHSCOPE_API_KEY=your-dashscope-api-key
+# VISION_API_KEY=another-api-key
+# VISION_BASE_URL=https://another-compatible-endpoint/v1
 ```
 
 后续 ASR / TTS 会使用这些变量，目前只是先写入配置：
@@ -163,7 +170,23 @@ OPENAI_MODEL=gpt-4o-mini
 
 - `.env` 是本地私密配置，已经被 `.gitignore` 忽略。
 - `.env.example` 只放示例，不要写真实 key。
+- `LOG_LEVEL=INFO` 会输出阶段耗时日志，测试性能时建议保留。
 - 如果修改了 `.env`，需要重启 uvicorn。
+
+## 架构约定
+
+当前项目仍然保持最小后端结构，暂时不引入复杂分层。新增文件遵守一个原则：文件名直接对应职责。
+
+- `main.py`：HTTP 路由入口，只做请求校验、调用业务函数、组织响应。
+- `router.py`：聊天编排，负责 memory、tool、知识卡和 LLM streaming。
+- `llm.py`：文本模型调用，不放业务逻辑。
+- `vision.py`：图片上传校验、保存、人工模拟识别结果。
+- `vision_llm.py`：视觉模型调用和识别结果 JSON 解析。
+- `artifacts.py`：本地文物知识卡加载和查询。
+- `sessions.py`：设备级内存状态。
+- `chat_cli.py` / `camera_upload_cli.py`：本地测试客户端，不参与后端核心链路。
+
+注释策略：只在容易误解的边界处写注释，例如“为什么 raw JPEG body”“为什么 `artifact_id` 会跳过视觉模型”。普通赋值和显而易见的代码不加重复注释，避免后面维护时注释和代码打架。
 
 ## 启动后端
 
@@ -189,6 +212,36 @@ Invoke-RestMethod http://127.0.0.1:8000/health
 ```json
 {"status":"ok"}
 ```
+
+## 耗时日志
+
+测试性能时，把启动后端的 PowerShell 窗口留着看日志。`LOG_LEVEL=INFO` 时，会输出每个关键阶段的耗时，单位是毫秒。
+
+图片上传链路会看到类似日志：
+
+```text
+2026-07-05 18:20:01 INFO [ai_box.main] camera.upload.start device=walkie-01 manual_artifact=False use_vision=True content_type=image/jpeg
+2026-07-05 18:20:01 INFO [ai_box.main] camera.upload.stage read_body_ms=1.2 bytes=14088
+2026-07-05 18:20:01 INFO [ai_box.main] camera.upload.stage save_image_ms=3.4 image_id=... size_bytes=14088
+2026-07-05 18:20:03 INFO [vision_llm] vision.recognition.stage api_call_ms=1820.5
+2026-07-05 18:20:03 INFO [ai_box.main] camera.upload.stage recognition_ms=1845.7 mode=vision_llm predicted_artifact_id=yingguo_jade_eagle accepted=True confidence=0.86
+2026-07-05 18:20:03 INFO [ai_box.main] camera.upload.done device=walkie-01 image_id=... latest_artifact_id=yingguo_jade_eagle total_ms=1860.2
+```
+
+聊天链路会看到：
+
+```text
+2026-07-05 18:20:10 INFO [router] chat.stage build_messages_ms=0.6 device=walkie-01 messages=4 latest_artifact_id=yingguo_jade_eagle
+2026-07-05 18:20:11 INFO [router] chat.stage first_token_ms=760.4 device=walkie-01
+2026-07-05 18:20:15 INFO [router] chat.done device=walkie-01 output_chars=218 total_ms=4730.8
+```
+
+重点看这几个字段：
+
+- `api_call_ms`：视觉模型本身耗时，通常是图片识别最慢的部分。
+- `recognition_ms`：整个识别阶段耗时，包含模型调用和本地解析。
+- `first_token_ms`：聊天首 token 延迟，决定用户感觉“等了多久才开始说话”。
+- `total_ms`：接口总耗时。
 
 ## 推荐测试方式
 
