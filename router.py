@@ -21,89 +21,10 @@ SYSTEM_PROMPT = (
 
 logger = logging.getLogger(__name__)
 
-FOLLOW_UP_TRIGGERS = (
-    "它",
-    "他",
-    "这件",
-    "这个",
-    "这东西",
-    "这个东西",
-    "那个",
-    "这是什么",
-    "这又是什么",
-    "这又是啥",
-    "又是什么",
-    "又是啥",
-    "是什么",
-    "是啥",
-    "什么文物",
-    "这是",
-    "刚才",
-    "上一件",
-    "继续",
-    "接着",
-    "再讲",
-    "为什么",
-    "意义",
-    "故事",
-    "用途",
-    "年代",
-    "出土",
-    "材料",
-    "纹饰",
-    "特点",
-    "重要",
-    "有什么",
-)
-
-FOLLOW_UP_PRONOUNS = (
-    "它",
-    "他",
-    "这",
-    "这件",
-    "这个",
-    "这东西",
-    "这个东西",
-    "那个",
-    "刚才",
-    "上一件",
-)
-
-FOLLOW_UP_QUESTION_WORDS = (
-    "什么",
-    "啥",
-    "哪",
-    "为什么",
-    "怎么",
-    "意义",
-    "故事",
-    "用途",
-    "年代",
-    "出土",
-    "材料",
-    "纹饰",
-    "特点",
-    "重要",
-    "继续",
-    "接着",
-    "再讲",
-    "有什么",
-)
-
 
 def should_call_tool(user_message: str) -> bool:
     text = user_message.lower()
     return "status" in text or "device" in text
-
-
-def looks_like_artifact_follow_up(user_message: str) -> bool:
-    text = "".join(user_message.split())
-    if any(trigger in text for trigger in FOLLOW_UP_TRIGGERS):
-        return True
-
-    has_pronoun = any(pronoun in text for pronoun in FOLLOW_UP_PRONOUNS)
-    has_question_word = any(word in text for word in FOLLOW_UP_QUESTION_WORDS)
-    return has_pronoun and has_question_word
 
 
 def resolve_artifact_context(
@@ -114,7 +35,7 @@ def resolve_artifact_context(
         session.latest_artifact_id = str(artifact_matches[0]["id"])
         return artifact_matches
 
-    if session.latest_artifact_id and looks_like_artifact_follow_up(user_message):
+    if session.latest_artifact_id:
         try:
             return [get_artifact(session.latest_artifact_id)]
         except ArtifactNotFoundError:
@@ -144,9 +65,7 @@ def build_messages(user_message: str, session: DeviceSession) -> list[dict[str, 
             }
         )
 
-    if session.latest_vision_description and (
-        artifact_matches or looks_like_artifact_follow_up(user_message)
-    ):
+    if session.latest_vision_description and artifact_matches:
         messages.append(
             {
                 "role": "system",
