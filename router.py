@@ -3,17 +3,15 @@ import logging
 from typing import AsyncIterator
 
 from llm import stream_chat_completion
+from sessions import DeviceSession, get_session, remember_turn
 from tools import get_device_status
 
-
-MAX_MEMORY_ROUNDS = 10
 
 SYSTEM_PROMPT = (
     "You are a concise AI assistant. If tool context is provided, use it as "
     "fresh device telemetry and mention relevant values when helpful."
 )
 
-memory: list[dict[str, str]] = []
 logger = logging.getLogger(__name__)
 
 
@@ -22,9 +20,9 @@ def should_call_tool(user_message: str) -> bool:
     return "status" in text or "device" in text
 
 
-def build_messages(user_message: str) -> list[dict[str, str]]:
+def build_messages(user_message: str, session: DeviceSession) -> list[dict[str, str]]:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(memory)
+    messages.extend(session.memory)
 
     if should_call_tool(user_message):
         tool_result = get_device_status()
@@ -42,17 +40,12 @@ def build_messages(user_message: str) -> list[dict[str, str]]:
     return messages
 
 
-def remember_turn(user_message: str, assistant_message: str) -> None:
-    memory.append({"role": "user", "content": user_message})
-    memory.append({"role": "assistant", "content": assistant_message})
-    del memory[:-MAX_MEMORY_ROUNDS * 2]
-
-
-async def chat_stream(user_message: str) -> AsyncIterator[str]:
+async def chat_stream(user_message: str, device_id: str) -> AsyncIterator[str]:
+    session = get_session(device_id)
     chunks: list[str] = []
 
     try:
-        async for token in stream_chat_completion(build_messages(user_message)):
+        async for token in stream_chat_completion(build_messages(user_message, session)):
             chunks.append(token)
             yield token
     except Exception as exc:
@@ -60,4 +53,4 @@ async def chat_stream(user_message: str) -> AsyncIterator[str]:
         yield f"\n[LLM_ERROR] {type(exc).__name__}: {exc}\n"
         return
 
-    remember_turn(user_message, "".join(chunks))
+    remember_turn(session, user_message, "".join(chunks))

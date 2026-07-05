@@ -16,8 +16,11 @@ def configure_stdio() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
-def stream_chat(message: str, url: str) -> None:
-    body = json.dumps({"message": message}, ensure_ascii=False).encode("utf-8")
+def stream_chat(message: str, url: str, device_id: str) -> None:
+    body = json.dumps(
+        {"message": message, "device": device_id},
+        ensure_ascii=False,
+    ).encode("utf-8")
     request = urllib.request.Request(
         url,
         data=body,
@@ -44,8 +47,8 @@ def stream_chat(message: str, url: str) -> None:
     print()
 
 
-def run_repl(url: str) -> None:
-    print("Terminal chat client. Type /exit to quit.")
+def run_repl(url: str, device_id: str) -> None:
+    print(f"Terminal chat client. Device: {device_id}. Type /exit to quit.")
     while True:
         try:
             message = input("\nYou> ").strip()
@@ -60,7 +63,7 @@ def run_repl(url: str) -> None:
 
         print("AI> ", end="", flush=True)
         try:
-            stream_chat(message, url)
+            stream_chat(message, url, device_id)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             print(f"\n[HTTP_ERROR] {exc.code}: {detail}")
@@ -75,14 +78,15 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Simple terminal chat client.")
     parser.add_argument("message", nargs="*", help="Send one message and exit.")
+    parser.add_argument("--device", default="default", help="Device/session id. Default: default")
     parser.add_argument("--url", default=DEFAULT_URL, help=f"Chat endpoint. Default: {DEFAULT_URL}")
     args = parser.parse_args()
 
     if args.message:
-        stream_chat(" ".join(args.message), args.url)
+        stream_chat(" ".join(args.message), args.url, args.device)
         return
 
-    run_repl(args.url)
+    run_repl(args.url, args.device)
 
 
 if __name__ == "__main__":

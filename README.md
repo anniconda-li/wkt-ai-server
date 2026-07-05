@@ -6,7 +6,7 @@
 
 - `/chat` 聊天接口
 - 模型 streaming 输出
-- 最近 10 轮内存 memory
+- 按设备隔离的最近 10 轮内存 memory
 - 简单 tool 调用机制
 - OpenAI / DeepSeek / 其他 OpenAI-compatible 服务商
 - Windows PowerShell 下的终端测试客户端
@@ -19,6 +19,7 @@
 .
 ├── main.py           # FastAPI app，定义 /health 和 /chat
 ├── router.py         # 组装上下文、memory、tool 判断、流式转发
+├── sessions.py       # 按 device_id 管理设备会话和 memory
 ├── llm.py            # 封装 OpenAI-compatible streaming 调用
 ├── tools.py          # 示例 tool：get_device_status()
 ├── chat_cli.py       # 终端聊天客户端，方便本地测试
@@ -34,6 +35,7 @@
 ```text
 用户输入消息
   -> main.py 接收 POST /chat
+  -> sessions.py 获取该 device 的会话
   -> router.py 构造 messages
   -> router.py 判断是否需要调用 tool
   -> llm.py 调用模型 API，stream=True
@@ -46,6 +48,7 @@
 
 - `main.py` 负责 HTTP 接口。
 - `router.py` 负责业务编排。
+- `sessions.py` 负责设备上下文和短期记忆。
 - `llm.py` 负责模型调用。
 - `tools.py` 负责外部工具能力。
 - `chat_cli.py` 只是测试客户端，不参与后端核心逻辑。
@@ -142,6 +145,12 @@ You> 你还记得我叫什么吗？
 AI> 当然记得，你叫李庆博 ...
 ```
 
+指定设备会话：
+
+```powershell
+.\.venv\Scripts\python.exe chat_cli.py --device walkie-01
+```
+
 退出：
 
 ```text
@@ -151,7 +160,7 @@ You> /exit
 也可以单次调用：
 
 ```powershell
-.\.venv\Scripts\python.exe chat_cli.py "what is the device status?"
+.\.venv\Scripts\python.exe chat_cli.py --device walkie-01 "what is the device status?"
 ```
 
 ## 手动 HTTP 测试
@@ -196,7 +205,8 @@ curl.exe --% -N -X POST http://127.0.0.1:8000/chat -H "Content-Type: application
 
 ```json
 {
-  "message": "hello"
+  "message": "hello",
+  "device": "walkie-01"
 }
 ```
 
@@ -206,15 +216,53 @@ curl.exe --% -N -X POST http://127.0.0.1:8000/chat -H "Content-Type: application
 Hello! How can I help you today?
 ```
 
-## Memory 实现
+### GET /sessions
 
-`router.py` 中有一个进程内 list：
+查看当前后端里有哪些设备 session。
 
-```python
-memory: list[dict[str, str]] = []
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/sessions
 ```
 
-每次模型完整回复结束后，会保存：
+### GET /sessions/{device_id}
+
+查看某台设备的上下文和 memory。
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/sessions/walkie-01
+```
+
+### POST /sessions/{device_id}/clear
+
+清空某台设备的短期 memory。
+
+```powershell
+Invoke-RestMethod -Method POST http://127.0.0.1:8000/sessions/walkie-01/clear
+```
+
+## Memory 实现
+
+当前 memory 已经按 `device_id` 隔离。`sessions.py` 中维护一个进程内字典：
+
+```python
+sessions: dict[str, DeviceSession] = {}
+```
+
+每台设备都有自己的 `DeviceSession`：
+
+```python
+@dataclass
+class DeviceSession:
+    device_id: str
+    memory: list[dict[str, str]]
+    latest_image_id: str | None
+    latest_artifact_id: str | None
+    latest_vision_description: str | None
+    last_answer: str | None
+    upload_generation: int
+```
+
+每次模型完整回复结束后，会向对应设备 session 保存：
 
 - 当前用户消息
 - 当前助手回复
@@ -222,14 +270,15 @@ memory: list[dict[str, str]] = []
 最多保留最近 10 轮，也就是 20 条 message：
 
 ```python
-del memory[:-MAX_MEMORY_ROUNDS * 2]
+del session.memory[:-MAX_MEMORY_ROUNDS * 2]
 ```
 
 注意：
 
 - memory 只在当前 Python 进程内有效。
 - 重启服务后 memory 会清空。
-- 当前版本没有多用户隔离，所有请求共享同一个 memory。
+- 当前版本已经按 `device_id` 隔离 memory。
+- 后续接 ESP32 时，`walkie-01`、`walkie-02` 应该各自使用自己的 device id。
 
 ## Tool 调用实现
 
