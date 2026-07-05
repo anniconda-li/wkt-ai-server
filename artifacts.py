@@ -60,3 +60,17 @@ def find_artifacts_by_text(text: str) -> list[dict[str, Any]]:
             matches.append(artifact)
 
     return matches
+
+
+def to_llm_context(artifact: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": artifact.get("id"),
+        "name": artifact.get("name"),
+        "aliases": artifact.get("aliases", []),
+        "category": artifact.get("category"),
+        "period": artifact.get("period"),
+        "material": artifact.get("material"),
+        "visual_keywords": artifact.get("visual_keywords", []),
+        "recognition_features": artifact.get("recognition_features", []),
+        "facts": artifact.get("facts", []),
+    }

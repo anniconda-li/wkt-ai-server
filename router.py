@@ -2,15 +2,20 @@ import json
 import logging
 from typing import AsyncIterator
 
-from artifacts import find_artifacts_by_text
+from artifacts import find_artifacts_by_text, to_llm_context
 from llm import stream_chat_completion
 from sessions import DeviceSession, get_session, remember_turn
 from tools import get_device_status
 
 
 SYSTEM_PROMPT = (
-    "You are a concise AI assistant. If tool context is provided, use it as "
-    "fresh device telemetry and mention relevant values when helpful."
+    "You are a museum guide speaking directly to a visitor through a small "
+    "device. Your answer is displayed to the visitor, so do not describe how "
+    "to guide, teach, present, or explain. Just give the final visitor-facing "
+    "answer. Use only the provided artifact facts as factual grounding. If "
+    "details are marked as pending confirmation, say briefly that the exhibit "
+    "record is still being completed instead of inventing dates, provenance, "
+    "or stories. Keep the tone warm, clear, and suitable for listening."
 )
 
 logger = logging.getLogger(__name__)
@@ -27,12 +32,16 @@ def build_messages(user_message: str, session: DeviceSession) -> list[dict[str, 
 
     artifact_matches = find_artifacts_by_text(user_message)
     if artifact_matches:
+        artifact_context = [to_llm_context(artifact) for artifact in artifact_matches]
         messages.append(
             {
                 "role": "system",
                 "content": (
-                    "Local artifact knowledge cards matched by the user message:\n"
-                    f"{json.dumps(artifact_matches, ensure_ascii=False)}"
+                    "Matched local artifact knowledge cards. These are facts "
+                    "for generating the final visitor-facing answer. Do not "
+                    "say 'you can explain', do not give instructions to a "
+                    "guide, and do not describe the answer strategy:\n"
+                    f"{json.dumps(artifact_context, ensure_ascii=False)}"
                 ),
             }
         )
