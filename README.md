@@ -30,7 +30,9 @@
 ├── tools.py          # 示例 tool：get_device_status()
 ├── data/artifacts/   # 5 件核心文物的本地 JSON 知识卡
 ├── uploads/          # 本地上传图片目录，git 忽略
+├── samples/camera/   # ESP32 实拍测试图片
 ├── chat_cli.py       # 终端聊天客户端，方便本地测试
+├── camera_upload_cli.py # 终端图片上传测试客户端
 ├── requirements.txt  # Python 依赖
 ├── .env.example      # 环境变量示例，不放真实 key
 └── .gitignore        # 忽略 .env、.venv、缓存文件
@@ -77,6 +79,7 @@
 - `llm.py` 负责模型调用。
 - `tools.py` 负责外部工具能力。
 - `chat_cli.py` 只是测试客户端，不参与后端核心逻辑。
+- `camera_upload_cli.py` 是图片上传测试客户端，不参与后端核心逻辑。
 
 ## 环境准备
 
@@ -186,6 +189,37 @@ You> /exit
 
 ```powershell
 .\.venv\Scripts\python.exe chat_cli.py --device walkie-01 "what is the device status?"
+```
+
+上传 ESP32 实拍样例图：
+
+```powershell
+.\.venv\Scripts\python.exe camera_upload_cli.py `
+  samples\camera\yingguo_jade_eagle_esp32.jpg `
+  --device walkie-01 `
+  --artifact-id yingguo_jade_eagle `
+  --vision-description "ESP32 实拍图：浅色玉质鹰形器，呈展翅姿态。"
+```
+
+另一张样例图：
+
+```powershell
+.\.venv\Scripts\python.exe camera_upload_cli.py `
+  samples\camera\shuyao_chuilin_sheng_ding_esp32.jpg `
+  --device walkie-01 `
+  --artifact-id shuyao_chuilin_sheng_ding `
+  --vision-description "ESP32 实拍图：青铜升鼎，双耳外撇，三足，器身有复杂纹饰。"
+```
+
+上传后再用同一个设备 id 聊天：
+
+```powershell
+.\.venv\Scripts\python.exe chat_cli.py --device walkie-01
+```
+
+```text
+You> 这是什么？
+AI> 这是……
 ```
 
 ## 手动 HTTP 测试
@@ -387,6 +421,13 @@ AI> 这是应国玉鹰……
 ```
 
 如果不传 `artifact_id`，接口仍会保存图片并返回 `ready`，但会把该设备的 `latest_artifact_id` 清空，避免新图片未识别时还沿用旧文物上下文。
+
+项目里已经放了两张 ESP32 实拍样例图：
+
+- `samples/camera/yingguo_jade_eagle_esp32.jpg`
+- `samples/camera/shuyao_chuilin_sheng_ding_esp32.jpg`
+
+它们是测试夹具，不是知识库事实。当前用人工 `artifact_id` 模拟识别结果，后续接入真实视觉模型后，要让模型自己从图片判断文物。
 
 ### GET /artifacts
 
