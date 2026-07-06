@@ -113,9 +113,15 @@ def build_vision_candidates() -> list[dict[str, Any]]:
 
 def build_recognition_prompt(candidates: list[dict[str, Any]]) -> str:
     return (
-        "你是博物馆文物图片识别模块。请根据图片内容，在候选文物列表中选择最可能的一件。"
+        "你是博物馆文物图片识别模块。请先判断图片里是否存在清晰的文物主体，"
+        "再根据图片内容识别候选文物。"
         "图片可能来自 ESP32 摄像头，可能有模糊、眩光、屏幕反拍、畸变、遮挡或低分辨率。"
-        "你必须只从候选 artifact_id 中选择，无法确认时返回 unknown。"
+        "只有当图片中的主体视觉特征和某个候选文物的关键特征明确匹配时，"
+        "才可以返回该候选 artifact_id。"
+        "如果图片是空白、黑屏、过曝、桌面、地面、墙面、手指、人物、普通物品、"
+        "展厅环境但没有清晰文物主体，或者无法确认属于任何候选文物，必须返回 unknown。"
+        "返回 unknown 时 confidence 必须小于 0.30。"
+        "你必须只从候选 artifact_id 或 unknown 中选择。"
         "不要编造候选列表以外的新文物。不要写讲解词。"
         "只输出一个 JSON 对象，不要输出 Markdown，不要输出额外解释。"
         "JSON 字段必须是："

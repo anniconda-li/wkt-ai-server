@@ -695,6 +695,8 @@ AI> 这是应国玉鹰……
 
 如果视觉模型返回 `unknown`，或者置信度低于 `VISION_MIN_CONFIDENCE`，接口仍会返回 `ready`，但不会写入 `latest_artifact_id`，避免误把不确定图片当成某件文物。
 
+视觉识别不是强制五选一。`vision_llm.py` 会要求模型先判断图片里有没有清晰文物主体；如果是空照片、黑屏、过曝、桌面、墙面、手指、普通环境，或者无法确认属于 5 件候选文物之一，应该返回 `artifact_id: "unknown"` 且低置信度。后端会保存图片和视觉描述，但不会把它写成当前文物上下文。
+
 项目里已经放了两张 ESP32 实拍样例图：
 
 - `samples/camera/yingguo_jade_eagle_esp32.jpg`
