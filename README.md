@@ -33,6 +33,7 @@
 ├── tts.py            # 调用 TTS 并统一输出 ESP32 标准 WAV
 ├── wav_utils.py      # 设备 WAV 格式校验和测试 WAV 生成
 ├── router.py         # 组装上下文、memory、tool 判断、流式转发
+├── output_format.py  # 清理 Markdown，生成设备端可直接显示的纯文本
 ├── sessions.py       # 按 device_id 管理设备会话和 memory
 ├── artifacts.py      # 加载本地文物知识卡
 ├── vision.py         # 保存相机图片、模拟视觉识别结果
@@ -119,6 +120,7 @@
 - `tts.py` 负责调用 TTS，并把返回音频统一成设备要求的 WAV。
 - `wav_utils.py` 负责校验设备要求的 WAV 格式。
 - `router.py` 负责业务编排。
+- `output_format.py` 负责把模型回复规整成设备端可直接显示和朗读的纯文本。
 - `sessions.py` 负责设备上下文、当前文物和短期记忆。
 - `artifacts.py` 负责加载和查询本地文物知识卡。
 - `vision.py` 负责图片保存和人工模拟识别结果。
@@ -1020,6 +1022,13 @@ POST /sessions/{device_id}/artifact-context
 视觉识别只使用候选文物的名称、别名、类别、材质、`visual_keywords` 和 `recognition_features`。历史事实和讲解文本仍由聊天阶段使用，避免视觉模型把“讲故事”混进识别任务。
 
 回答生成有一个重要约束：模型输出就是设备端直接展示给游客的内容。因此 prompt 明确要求模型不要输出“讲解时可以这样带”“你可以引导游客观察”这类内部指导语，而是直接生成游客可听可看的讲解文本。知识卡里的 `guide_notes` 只作为后端维护资料保留，当前不会传给模型，避免模型把内部讲解建议原样说给游客。
+
+为了适配 ESP32 / LVGL 小屏显示，后端不会把模型原始 Markdown 直接给设备。`output_format.py` 会在非流式问答链路里清理 `**`、标题、列表、链接、代码符号和转义换行，并把 `answer_text` 规整成纯文本。TTS 也使用这份清洗后的文本，避免把 Markdown 符号读出来。
+
+此外，`router.py` 对两类高频入口做了确定性兜底：
+
+- 用户问“你是谁”时，直接回答“我是平顶山市博物馆的 AI 讲解助手”，不让模型绕开身份问题。
+- 当前设备没有识别到文物时，用户说“介绍一下吧”“讲讲吧”“这是什么”等模糊追问，后端会提示先拍展品照片或说出文物名称，不会编造“今天特展”或不存在的当前展品。
 
 ## Memory 实现
 

@@ -8,6 +8,7 @@ from typing import Callable
 from uuid import uuid4
 
 from llm import validate_llm_config
+from output_format import format_for_device_display
 from router import chat_response
 from sessions import normalize_device_id
 from tts import synthesize_to_device_wav
@@ -47,16 +48,16 @@ async def generate_answer_text(
 
     mock_answer = os.getenv("AI_MOCK_LLM_TEXT", "").strip()
     if mock_answer:
-        return mock_answer
+        return format_for_device_display(mock_answer)
 
     validate_llm_config()
-    return (
+    return format_for_device_display(
         await chat_response(
             cleaned,
             normalize_device_id(device_id),
             should_continue=should_continue,
         )
-    ).strip()
+    )
 
 
 async def run_text_pipeline(
