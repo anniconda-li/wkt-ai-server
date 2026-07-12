@@ -27,6 +27,12 @@ class ServiceIdentitySmokeTests(unittest.TestCase):
         expected = {
             "/health",
             "/chat",
+            "/sessions",
+            "/sessions/{device_id}",
+            "/sessions/{device_id}/clear",
+            "/sessions/{device_id}/artifact-context",
+            "/artifacts",
+            "/artifacts/{artifact_id}",
             "/camera/upload",
             "/ai/start",
             "/ai/upload",

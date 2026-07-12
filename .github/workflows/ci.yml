@@ -28,5 +28,9 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        env:
+          AI_ENV_FILE: .env.example
+        run: docker compose config --quiet
       - name: Build wkt-ai-server image
         run: docker build --tag wkt-ai-server:${{ github.sha }} .

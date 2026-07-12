@@ -9,3 +9,15 @@ uploads/
 outputs/
 *.pem
 *.key
+*.p12
+*.pfx
+secrets/
+
+# Runtime/local data; keep only the versioned static catalog and test fixtures.
+data/*
+!data/artifacts/
+!data/artifacts/*.json
+samples/*
+!samples/camera/
+!samples/camera/README.md
+!samples/camera/*.jpg

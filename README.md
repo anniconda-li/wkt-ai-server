@@ -8,7 +8,17 @@
 - Compose 服务名固定为 `ai`，容器名为 `wkt-ai-server`。
 - 本仓库只负责现有 AI 语音、ASR、TTS、WAV 分片和相机分析能力。
 - 本仓库保持独立 Git 仓库、独立 GitHub 仓库、独立 Docker 镜像和独立容器，不与对讲服务或 OTA 服务合并。
-- 本地父目录 `wkt-platform` 只用于归档三个独立后端目录，不初始化 Git，也不是 monorepo。
+- 本地父目录 `wkt-platform` 只用于归档四个独立 Git 仓库，不初始化 Git，也不是 monorepo：
+
+  ```text
+  wkt-platform/
+  ├── wkt-intercom-server
+  ├── wkt-ai-server
+  ├── wkt-ota-server
+  └── wkt-deploy
+  ```
+
+- `wkt-deploy` 负责跨服务部署编排；本仓库只提供 `ai` 服务自己的镜像、端口、健康检查和运行契约。
 - ESP-IDF 固件项目 `walkie-talkiev1` 位于 `wkt-platform` 之外，完全独立于本服务。
 - 本次名称规范化不改变现有 API 路径、端口、协议或请求响应格式。
 
@@ -313,6 +323,8 @@ docker compose up --build ai
 ```
 
 Compose 保持现有 `8000` 端口和 `.env` 配置方式。详细说明见 [`docs/deployment.md`](docs/deployment.md)。
+
+供 `wkt-deploy` 使用的固定契约摘要：镜像 `wkt-ai-server`、容器 `wkt-ai-server`、Compose 服务 `ai`、容器端口 `8000`、健康检查 `GET /health`、持久化目录 `/app/uploads` 和 `/app/outputs`。全部路由、环境变量、请求体限制、超时和单实例状态约束以 [`docs/deployment.md`](docs/deployment.md) 为准。
 
 ## 耗时日志
 
