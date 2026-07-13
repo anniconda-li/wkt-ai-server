@@ -19,6 +19,7 @@ class ModelDefaultsTests(unittest.TestCase):
             self.assertEqual(asr.get_asr_model(), "qwen3-asr-flash-2026-02-10")
             self.assertEqual(asr.get_asr_fallback_model(), "paraformer-realtime-v2")
             self.assertEqual(vision_llm.get_vision_model(), "qwen3.6-flash-2026-04-16")
+            self.assertEqual(vision_llm.get_vision_timeout_seconds(), 120.0)
             self.assertFalse(vision_llm.is_thinking_enabled())
             self.assertEqual(tts.DEFAULT_TTS_MODEL, "qwen3-tts-flash-2025-11-27")
 
@@ -138,6 +139,28 @@ class QwenAsrTests(unittest.TestCase):
 
 
 class VisionRequestTests(unittest.TestCase):
+    def test_vision_client_timeout_is_at_least_120_seconds(self) -> None:
+        previous_client = vision_llm._vision_client
+        vision_llm._vision_client = None
+        try:
+            with (
+                patch("vision_llm.AsyncOpenAI", return_value=object()) as openai_client,
+                patch.dict(
+                    os.environ,
+                    {
+                        "VISION_API_KEY": "test-key",
+                        "VISION_BASE_URL": "https://vision.example.test/v1",
+                        "VISION_TIMEOUT_SECONDS": "30",
+                    },
+                    clear=True,
+                ),
+            ):
+                vision_llm.get_vision_client()
+        finally:
+            vision_llm._vision_client = previous_client
+
+        self.assertEqual(openai_client.call_args.kwargs["timeout"], 120.0)
+
     def test_vision_disables_thinking_and_requests_json(self) -> None:
         response = SimpleNamespace(
             choices=[

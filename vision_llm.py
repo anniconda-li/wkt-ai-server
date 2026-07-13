@@ -59,6 +59,15 @@ def get_min_confidence() -> float:
     return min(max(value, 0.0), 1.0)
 
 
+def get_vision_timeout_seconds() -> float:
+    raw_value = os.getenv("VISION_TIMEOUT_SECONDS", "120").strip()
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return 120.0
+    return max(value, 120.0)
+
+
 def is_thinking_enabled() -> bool:
     value = os.getenv("VISION_ENABLE_THINKING", "false")
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -85,6 +94,7 @@ def get_vision_client() -> AsyncOpenAI:
         _vision_client = AsyncOpenAI(
             api_key=get_vision_api_key(),
             base_url=get_vision_base_url(),
+            timeout=get_vision_timeout_seconds(),
         )
     return _vision_client
 

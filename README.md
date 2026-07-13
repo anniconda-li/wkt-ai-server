@@ -204,10 +204,13 @@ VISION_PROVIDER=dashscope
 VISION_MODEL=qwen3.6-flash-2026-04-16
 VISION_ENABLE_THINKING=false
 VISION_MIN_CONFIDENCE=0.60
+VISION_TIMEOUT_SECONDS=120
 MAX_SAVED_IMAGES_PER_DEVICE=10
 CAMERA_UPLOAD_IDLE_TIMEOUT_SECONDS=8
-CAMERA_UPLOAD_TOTAL_TIMEOUT_SECONDS=30
-CAMERA_UPLOAD_PROGRESS_LOG_BYTES=4096
+CAMERA_IDEMPOTENCY_TTL_SECONDS=1200
+CAMERA_IDEMPOTENCY_MAX_RECORDS=1000
+CAMERA_IDEMPOTENCY_WAIT_TIMEOUT_SECONDS=180
+CAMERA_IDEMPOTENCY_POLL_INTERVAL_SECONDS=0.1
 ```
 
 一般不需要单独写 `VISION_API_KEY` 或 `VISION_BASE_URL`，它们会默认复用 `DASHSCOPE_API_KEY` 和 `DASHSCOPE_BASE_URL`。只有当视觉模型想换到另一个服务商或另一个百炼 endpoint 时，才需要覆盖：
@@ -425,8 +428,11 @@ You> /exit
 ```powershell
 .\.venv\Scripts\python.exe camera_upload_cli.py `
   samples\camera\yingguo_jade_eagle_esp32.jpg `
-  --device walkie-01
+  --device walkie-01 `
+  --request-id walkie-01-camera-local-1
 ```
+
+传入 `--request-id` 后，测试客户端会自动计算并发送 `X-Content-SHA256`；模拟同一次弱网重试时必须复用同一个值和同一张图片。
 
 另一张样例图：
 
@@ -693,15 +699,21 @@ AI> 它是平顶山“鹰城”文化的重要象征……
 ```env
 MAX_SAVED_IMAGES_PER_DEVICE=10
 CAMERA_UPLOAD_IDLE_TIMEOUT_SECONDS=8
-CAMERA_UPLOAD_TOTAL_TIMEOUT_SECONDS=30
-CAMERA_UPLOAD_PROGRESS_LOG_BYTES=4096
+CAMERA_IDEMPOTENCY_TTL_SECONDS=1200
+CAMERA_IDEMPOTENCY_MAX_RECORDS=1000
+CAMERA_IDEMPOTENCY_WAIT_TIMEOUT_SECONDS=180
+CAMERA_IDEMPOTENCY_POLL_INTERVAL_SECONDS=0.1
 ```
 
 清理只针对 `uploads/{device_id}/` 下的 `.jpg` 图片，不会影响语音请求和回复 WAV。
 
-后端会流式接收 raw JPEG，并校验声明的 `Content-Length` 和实际字节数。连续 8 秒没有收到新字节时返回 HTTP 408，整次请求体接收最多等待 30 秒；两项均可通过上述环境变量调整。`CAMERA_UPLOAD_PROGRESS_LOG_BYTES` 控制 INFO 日志的进度间隔，默认每累计 4096 字节记录一次，便于区分设备/TCP 停发和服务端未消费。请求体超过 8 MiB 会返回 HTTP 413，客户端中途断连或长度不符会返回 HTTP 400。
+后端在解析必要参数和请求头后立即流式消费 raw JPEG；完整收完以前不会保存图片、查文物、访问外部模型或执行其他慢任务。`Content-Length` 必须存在且为合法整数，实际字节数必须完全一致，JPEG 最大 8 MiB。连续 8 秒没有任何新字节时返回 HTTP 408；这是“连续无进展”空闲超时，不限制弱网下整次上传的总时长。客户端中途断连或长度不符返回 HTTP 400，空 body 或非法 JPEG 也不会进入视觉识别。
 
-接收阶段的错误响应会携带 `reason / message / received_bytes / expected_bytes`，并发送 `Connection: close`，避免半包请求残留在 HTTP keep-alive 连接中。设备端应把 HTTP 408 视为本次上传失败并重新建立连接，最多重试一次完整 JPEG；不要从中断偏移继续发送。
+接收阶段的错误响应会携带 `reason / message / received_bytes / expected_bytes`，并发送 `Connection: close`，避免半包请求残留在 HTTP keep-alive 连接中。
+
+新设备应同时发送 `X-Request-ID` 和 `X-Content-SHA256`。SHA-256 是完整 JPEG 的 64 位小写十六进制摘要；摘要不符返回 HTTP 422。相同请求 ID、设备、摘要和长度的并发或后续重试只保存、识别一次，并在同一个 POST 中等待或复用相同最终响应；任一身份字段冲突返回 HTTP 409。旧设备不发送这两个请求头时仍按原逻辑处理，但不具备跨重试幂等保证。
+
+幂等状态保存在 `uploads/camera_idempotency.sqlite3`，默认 TTL 20 分钟、最多 1000 条；过期记录会在后续访问或清理时删除，容量满时优先淘汰最早完成的记录。SQLite 事务使同一共享 `uploads` 文件系统上的多个 worker 也不会重复认图，不过本服务的 `/ai` 会话等其他状态仍要求部署保持单 worker、单副本。
 
 接口形态特意使用 raw JPEG body，而不是 multipart。这样以后 ESP32 C 端更容易对齐：HTTP body 直接发送 JPEG 字节即可。
 
@@ -710,8 +722,21 @@ CAMERA_UPLOAD_PROGRESS_LOG_BYTES=4096
 ```text
 POST /camera/upload?device=walkie-01
 Content-Type: image/jpeg
+Content-Length: 31498
+X-Request-ID: walkie-01-camera-123456-7
+X-Content-SHA256: <完整 JPEG 的 64 位小写 SHA-256>
 
 <JPEG bytes>
+```
+
+设备端遇到写入无进展、连接断开、HTTP 408/5xx 或等待响应超时，应关闭旧连接并指数退避后重发完整 JPEG；重试必须复用同一个 `X-Request-ID`、同一 JPEG 和同一 SHA-256，不能从 12 KB 等中断偏移续传。收到 HTTP 409/422/4xx 参数错误时不要原样重试。完整 JPEG 已到达后即使原连接断开，后端也会继续完成识别，后续相同请求会拿到缓存的最终结果。
+
+阶段日志示例：
+
+```text
+camera.upload.body_received device=walkie-01 request_id=walkie-01-camera-123456-7 content_length=31498 bytes_received=31498 sha256=... stage_ms=842.1 total_ms=842.4 result=complete
+camera.recognition.done device=walkie-01 request_id=walkie-01-camera-123456-7 content_length=31498 bytes_received=31498 sha256=... stage_ms=1468.3 total_ms=2322.8 result=recognized mode=vision_llm
+camera.upload.done device=walkie-01 request_id=walkie-01-camera-123456-7 content_length=31498 bytes_received=31498 sha256=... stage_ms=2323.0 total_ms=2323.0 result=ready image_id=...
 ```
 
 人工标注对照请求：

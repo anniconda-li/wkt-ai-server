@@ -71,7 +71,16 @@ def save_camera_image(
 
     filename = f"{image_id}.jpg"
     path = device_dir / filename
-    path.write_bytes(image_bytes)
+    temporary_path = device_dir / f".{filename}.{uuid4().hex}.part"
+    try:
+        temporary_path.write_bytes(image_bytes)
+        temporary_path.replace(path)
+    except OSError:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     cleanup_old_camera_images(device_dir, get_max_saved_images_per_device())
 
     return {
