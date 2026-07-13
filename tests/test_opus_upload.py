@@ -3,6 +3,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -73,6 +74,19 @@ class OpusPacketsTests(unittest.TestCase):
             info = validate_device_wav(wav)
             self.assertEqual(info["sample_rate"], 16000)
             self.assertAlmostEqual(info["duration_seconds"], 0.2, places=2)
+
+    def test_ffmpeg_decode_is_limited_to_one_thread(self) -> None:
+        completed = SimpleNamespace(returncode=0, stderr="")
+        with patch("opus_packets.subprocess.run", return_value=completed) as run:
+            decode_ogg_to_device_wav(Path("request.ogg"), Path("request.wav"))
+
+        command = run.call_args.args[0]
+        self.assertEqual(command.count("-threads"), 2)
+        for index, value in enumerate(command):
+            if value == "-threads":
+                self.assertEqual(command[index + 1], "1")
+        filter_index = command.index("-filter_threads")
+        self.assertEqual(command[filter_index + 1], "1")
 
 
 class OpusUploadApiTests(unittest.TestCase):

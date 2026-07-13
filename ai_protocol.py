@@ -366,8 +366,24 @@ def prepare_asr_audio(session: AiSession) -> tuple[Path, Path, float]:
 
     if session.request_ogg_path is None:
         raise OpusPacketsError("request Ogg path missing")
+    mux_start = perf_counter()
     opus = mux_aop1_to_ogg(session.request_audio_path, session.request_ogg_path)
+    logger.info(
+        "ai.audio.opus_mux.done session=%s frames=%d duration=%.2f bytes=%d ms=%.1f",
+        session.session_id,
+        opus.frame_count,
+        opus.duration_seconds,
+        session.request_ogg_path.stat().st_size,
+        elapsed_ms(mux_start),
+    )
+    decode_start = perf_counter()
     decode_ogg_to_device_wav(session.request_ogg_path, session.request_wav_path)
+    logger.info(
+        "ai.audio.opus_decode.done session=%s wav_bytes=%d ms=%.1f ffmpeg_threads=1",
+        session.session_id,
+        session.request_wav_path.stat().st_size,
+        elapsed_ms(decode_start),
+    )
     wav_info = validate_device_wav(session.request_wav_path)
     decoded_duration = wav_info["duration_seconds"]
     if abs(decoded_duration - opus.duration_seconds) > 0.1:
@@ -409,6 +425,12 @@ async def run_asr_stage(session: AiSession) -> None:
         return
 
     try:
+        logger.info(
+            "ai.asr.request.start session=%s format=%s model=%s",
+            session.session_id,
+            asr_audio_path.suffix.lower().lstrip("."),
+            os.getenv("ASR_MODEL", "qwen3-asr-flash-2026-02-10"),
+        )
         asr_result = await asyncio.to_thread(
             transcribe_device_audio,
             asr_audio_path,

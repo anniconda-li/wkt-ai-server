@@ -208,12 +208,18 @@ def decode_ogg_to_device_wav(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     command = [
         os.getenv("FFMPEG_BIN", "ffmpeg"),
+        "-threads",
+        "1",
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
         "-i",
         str(source),
+        "-filter_threads",
+        "1",
+        "-threads",
+        "1",
         "-ac",
         "1",
         "-ar",
