@@ -62,11 +62,11 @@ docker compose config
 
 | 容器路径 | 用途 | 部署要求 |
 | --- | --- | --- |
-| `/app/uploads` | 相机 JPEG、相机幂等 SQLite、设备上传 WAV、处理后的回复 WAV | 必须持久化；生产环境使用命名卷或宿主机受控目录 |
+| `/app/uploads` | 相机 JPEG、JPEG 分片临时文件、相机 SQLite、设备上传 WAV、处理后的回复 WAV | 必须持久化；生产环境使用命名卷或宿主机受控目录 |
 | `/app/outputs` | 本地文本/TTS 客户端生成的回复文件 | 建议持久化；不用仓库内临时目录承载生产数据 |
 | `/app/data/artifacts` | 随镜像发布的只读文物知识卡 | 不挂载运行时空目录覆盖 |
 
-相机 `X-Request-ID` 幂等状态保存在 `/app/uploads/camera_idempotency.sqlite3`，SQLite 事务可在共享该文件的多个 worker 之间协调。但设备会话、聊天记忆和 `/ai` 处理状态仍保存在进程内存中，所以整体部署仍必须保持单进程、单副本；不要因为相机幂等本身支持多 worker 就提高整个服务的 worker 数。容器重启会清空内存会话，客户端需要重新开始会话。
+相机 `X-Request-ID` 幂等状态和 JPEG 分片元数据保存在 `/app/uploads/camera_idempotency.sqlite3`，SQLite 事务可在共享该文件与 `/app/uploads/camera_chunks` 的多个 worker 之间协调。未完成会话按 TTL 后台清理；识别中的会话通过续租避免被清理，进程异常后则会在租约过期后回收。但设备会话、聊天记忆和 `/ai` 处理状态仍保存在进程内存中，所以整体部署仍必须保持单进程、单副本；不要因为相机上传本身支持多 worker 就提高整个服务的 worker 数。容器重启会清空内存会话，客户端需要重新开始会话。
 
 ## HTTP 路由
 
@@ -83,6 +83,9 @@ docker compose config
 | `GET` | `/artifacts` | 文物知识卡摘要列表 |
 | `GET` | `/artifacts/{artifact_id}` | 文物知识卡详情 |
 | `POST` | `/camera/upload` | raw JPEG body；必须有 `Content-Length`；可选成对发送 `X-Request-ID`、`X-Content-SHA256`；query：`device`、可选 `artifact_id`、`vision_description`、`use_vision` |
+| `POST` | `/camera/upload/chunk` | 最大 4096 字节 raw chunk；query：`device`、`request_id`、`offset`、`total`；完整图和分片 SHA 请求头必填 |
+| `POST` | `/camera/upload/finish` | 空 body；query：`device`、`request_id`；同步校验、识别并返回最终业务结果 |
+| `POST` | `/camera/upload/cancel` | 空 body；query：`device`、`request_id`；幂等取消未开始识别的上传 |
 | `POST` | `/ai/start` | JSON：`device`、`language`、可选 `audio_format`；返回 session、确认格式和 `chunk_size=32768` |
 | `POST` | `/ai/upload` | raw WAV 或 AOP1 chunk；query：`session`、`index`、`offset`、`total`、可选 `device` |
 | `POST` | `/ai/finish` | query：`session`、可选 `device`；后台启动 ASR/LLM/TTS |
@@ -115,6 +118,10 @@ docker compose config
 | 图片幂等 | `CAMERA_IDEMPOTENCY_DB_PATH` | 默认 `/app/uploads/camera_idempotency.sqlite3` |
 | 图片幂等 | `CAMERA_IDEMPOTENCY_TTL_SECONDS`, `CAMERA_IDEMPOTENCY_MAX_RECORDS` | `1200`, `1000` |
 | 图片幂等 | `CAMERA_IDEMPOTENCY_WAIT_TIMEOUT_SECONDS`, `CAMERA_IDEMPOTENCY_POLL_INTERVAL_SECONDS` | `180`, `0.1` |
+| 图片分片 | `CAMERA_CHUNK_TEMP_DIR` | 默认 `/app/uploads/camera_chunks` |
+| 图片分片 | `CAMERA_CHUNK_SESSION_TTL_SECONDS`, `CAMERA_CHUNK_COMPLETED_TTL_SECONDS` | `600`, `1200` |
+| 图片分片 | `CAMERA_CHUNK_MAX_SESSIONS`, `CAMERA_CHUNK_MAX_TEMP_BYTES` | `100`, `67108864`（64 MiB） |
+| 图片分片 | `CAMERA_CHUNK_CLEANUP_INTERVAL_SECONDS` | `60` 秒 |
 | ASR | `ASR_PROVIDER`, `ASR_MODEL` | `dashscope`, `qwen3-asr-flash-2026-02-10` |
 | ASR | `ASR_FALLBACK_MODEL` | `paraformer-realtime-v2`；留空禁用回退 |
 | ASR | `ASR_API_KEY` | 可选；默认复用 `DASHSCOPE_API_KEY` |
@@ -139,6 +146,8 @@ docker compose config
 | 链路 | 应用限制 | 部署层要求 |
 | --- | --- | --- |
 | `/camera/upload` | JPEG 最小 128 字节，最大 8 MiB；必须校验 `Content-Length`；默认连续 8 秒无新字节才算上传空闲超时，没有固定总接收时长 | 反向代理请求体上限建议 9 MiB；请求体空闲超时约 15 秒；关闭请求缓冲，让应用立即消费 body |
+| `/camera/upload/chunk` | 每片最多 4096 字节，非末片必须正好 4096 字节；完整图仍最大 8 MiB | 请求体上限建议 5 KiB；不要缓存或改写 raw body |
+| `/camera/upload/finish` | 空 body；同步等待视觉模型并返回最终 JSON | 响应读取超时建议 300 秒 |
 | `/ai/upload` | PCM WAV 最大 2,100,000 字节；AOP1 Opus 最大 262,144 字节；建议分片 32,768 字节 | 允许 `application/octet-stream` 和 `application/vnd.wkt.opus-packets`，不改写 query 或 raw body |
 | `/ai/result_chunk` | 单次最多返回 32,768 字节 | 允许 `audio/wav` 二进制响应 |
 | TTS 回复 WAV | 最大 4,000,000 字节 | `/app/uploads` 需要足够磁盘空间 |
@@ -159,6 +168,31 @@ location = /camera/upload {
     proxy_read_timeout 300s;
     proxy_send_timeout 15s;
     send_timeout 300s;
+    proxy_pass http://wkt_ai_server;
+}
+
+location = /camera/upload/chunk {
+    client_max_body_size 5k;
+    client_body_timeout 15s;
+    proxy_request_buffering off;
+    proxy_http_version 1.1;
+    proxy_send_timeout 15s;
+    proxy_read_timeout 30s;
+    proxy_pass http://wkt_ai_server;
+}
+
+location = /camera/upload/finish {
+    client_max_body_size 1k;
+    proxy_http_version 1.1;
+    proxy_read_timeout 300s;
+    send_timeout 300s;
+    proxy_pass http://wkt_ai_server;
+}
+
+location = /camera/upload/cancel {
+    client_max_body_size 1k;
+    proxy_http_version 1.1;
+    proxy_read_timeout 30s;
     proxy_pass http://wkt_ai_server;
 }
 ```

@@ -26,6 +26,7 @@
 
 - `/chat` 聊天接口
 - `/camera/upload` JPEG 图片上传接口
+- `/camera/upload/chunk` + `/finish` JPEG 弱网分片上传接口
 - `/ai/*` ESP32 语音分片上传、ASR、轮询结果、按需拉取 WAV 协议
 - 本地文本 -> LLM -> TTS -> ESP32 WAV 测试链路
 - 模型 streaming 输出
@@ -59,6 +60,8 @@
 ├── artifacts.py      # 加载本地文物知识卡
 ├── vision.py         # 保存相机图片、模拟视觉识别结果
 ├── vision_llm.py     # 调用 DashScope Qwen-VL 做候选约束识别
+├── camera_idempotency.py # 相机识别结果的 SQLite 幂等状态
+├── camera_chunk_upload.py # JPEG 分片会话、临时文件和清理策略
 ├── llm.py            # 封装 OpenAI-compatible streaming 调用
 ├── tools.py          # 示例 tool：get_device_status()
 ├── data/artifacts/   # 5 件核心文物的本地 JSON 知识卡
@@ -809,6 +812,66 @@ AI> 这是应国玉鹰……
 - `samples/camera/shuyao_chuilin_sheng_ding_esp32.jpg`
 
 它们是测试夹具，不是知识库事实。现在可以直接不传 `artifact_id` 测真实视觉识别，也可以传 `artifact_id` 做人工标注对照。
+
+### JPEG 分片上传：chunk + finish
+
+弱网设备可以把同一 JPEG 拆成多个独立 HTTP POST，每片最多 4096 字节。`POST /camera/upload/chunk` 只校验并持久化分片；最后调用 `POST /camera/upload/finish`，finish 会在同一个请求中校验完整 JPEG、保存图片、执行视觉识别并返回与旧 `/camera/upload` 相同的最终 JSON。没有 start 接口，也没有识别轮询接口。
+
+上传状态不使用客户端 IP 或 TCP 连接，而是由 `request_id + device + total + image_sha256` 唯一绑定。元数据表 `camera_chunk_uploads`、`camera_chunk_parts` 与现有 `camera_idempotency` 共用 `uploads/camera_idempotency.sqlite3`；临时分片文件位于 `uploads/camera_chunks/{device}/<uuid>.jpeg.part`。完整识别后删除临时文件，但保留限时结果记录供 finish 重试。
+
+默认边界：
+
+```env
+CAMERA_CHUNK_SESSION_TTL_SECONDS=600
+CAMERA_CHUNK_COMPLETED_TTL_SECONDS=1200
+CAMERA_CHUNK_MAX_SESSIONS=100
+CAMERA_CHUNK_MAX_TEMP_BYTES=67108864
+CAMERA_CHUNK_CLEANUP_INTERVAL_SECONDS=60
+# CAMERA_CHUNK_TEMP_DIR=uploads/camera_chunks
+```
+
+Linux curl 示例，先准备公共变量并把 JPEG 切成 4096 字节文件：
+
+```bash
+IMAGE=artifact.jpg
+DEVICE=walkie-01
+REQUEST_ID=walkie-01-camera-123
+TOTAL=$(stat -c%s "$IMAGE")
+IMAGE_SHA=$(sha256sum "$IMAGE" | awk '{print $1}')
+split -b 4096 -d -a 4 "$IMAGE" /tmp/camera-chunk-
+```
+
+上传第一片；后续分片只需要递增 `offset`，最后一片可以不足 4096 字节：
+
+```bash
+CHUNK=/tmp/camera-chunk-0000
+OFFSET=0
+CHUNK_SHA=$(sha256sum "$CHUNK" | awk '{print $1}')
+
+curl -X POST \
+  "http://127.0.0.1:18080/camera/upload/chunk?device=$DEVICE&request_id=$REQUEST_ID&offset=$OFFSET&total=$TOTAL" \
+  -H 'Content-Type: application/octet-stream' \
+  -H "X-Image-SHA256: $IMAGE_SHA" \
+  -H "X-Chunk-SHA256: $CHUNK_SHA" \
+  --data-binary "@$CHUNK"
+```
+
+完成上传并同步等待视觉结果：
+
+```bash
+curl -X POST \
+  "http://127.0.0.1:18080/camera/upload/finish?device=$DEVICE&request_id=$REQUEST_ID" \
+  -H "X-Image-SHA256: $IMAGE_SHA"
+```
+
+取消尚未进入识别的上传：
+
+```bash
+curl -X POST \
+  "http://127.0.0.1:18080/camera/upload/cancel?device=$DEVICE&request_id=$REQUEST_ID"
+```
+
+分片响应中的 `next_offset` 是服务器真实进度。重复发送已确认且摘要一致的分片会返回 200、不会重复写入；offset 超前返回 409，设备应从响应的 `next_offset` 继续。finish 正在识别时的重复请求会等待同一个幂等任务，响应丢失后再次 finish 也不会重复调用视觉模型。取消正在识别的任务会返回 `recognition_in_progress`，因为跨 worker 的外部模型请求不能安全强制终止。
 
 ### POST /ai/start
 

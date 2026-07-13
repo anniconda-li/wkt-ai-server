@@ -33,6 +33,15 @@ from camera_idempotency import (
     camera_idempotency_wait_timeout_seconds,
     get_camera_idempotency_store,
 )
+from camera_chunk_upload import (
+    MAX_CHUNK_BYTES,
+    CameraChunkError,
+    CameraChunkIdentity,
+    CameraChunkSession,
+    CameraChunkStore,
+    camera_chunk_cleanup_interval_seconds,
+    get_camera_chunk_store,
+)
 from artifacts import ArtifactNotFoundError, get_artifact, list_artifacts
 from llm import validate_llm_config
 from router import chat_stream
@@ -77,6 +86,36 @@ app = FastAPI(
     description="Walkie-talkie AI voice, ASR, TTS, WAV/Opus chunking, and camera analysis service.",
     version="0.1.0",
 )
+
+_camera_chunk_cleanup_task: asyncio.Task[None] | None = None
+
+
+async def camera_chunk_cleanup_loop() -> None:
+    while True:
+        await asyncio.sleep(camera_chunk_cleanup_interval_seconds())
+        try:
+            await asyncio.to_thread(get_camera_chunk_store().cleanup)
+        except Exception as exc:
+            logger.error("camera.chunk.cleanup_failed error=%s", type(exc).__name__)
+
+
+@app.on_event("startup")
+async def start_camera_chunk_cleanup() -> None:
+    global _camera_chunk_cleanup_task
+    _camera_chunk_cleanup_task = asyncio.create_task(camera_chunk_cleanup_loop())
+
+
+@app.on_event("shutdown")
+async def stop_camera_chunk_cleanup() -> None:
+    global _camera_chunk_cleanup_task
+    if _camera_chunk_cleanup_task is None:
+        return
+    _camera_chunk_cleanup_task.cancel()
+    try:
+        await _camera_chunk_cleanup_task
+    except asyncio.CancelledError:
+        pass
+    _camera_chunk_cleanup_task = None
 
 
 def elapsed_ms(start: float) -> float:
@@ -123,6 +162,20 @@ class CameraLogContext:
     bytes_received: int
     sha256: str
     total_start: float
+    offset: int = -1
+    chunk_size: int = 0
+    next_offset: int | None = None
+
+
+@dataclass(frozen=True)
+class CameraChunkRequestMetadata:
+    device_id: str
+    request_id: str
+    offset: int
+    total: int
+    content_length: int
+    image_sha256: str
+    chunk_sha256: str
 
 
 CAMERA_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -296,6 +349,7 @@ def camera_log(
     logger.log(
         level,
         "%s device=%s request_id=%s content_length=%d bytes_received=%d sha256=%s "
+        "offset=%d chunk_size=%d received=%d total=%d next_offset=%d "
         "stage_ms=%.1f total_ms=%.1f result=%s%s",
         event,
         context.device_id,
@@ -303,6 +357,11 @@ def camera_log(
         context.content_length,
         context.bytes_received,
         context.sha256,
+        context.offset,
+        context.chunk_size,
+        context.bytes_received,
+        context.content_length,
+        context.next_offset if context.next_offset is not None else context.bytes_received,
         elapsed_ms(stage_start),
         elapsed_ms(context.total_start),
         result,
@@ -331,6 +390,272 @@ def camera_outcome_response(outcome: CameraStoredOutcome) -> object:
     if 200 <= outcome.status_code < 300:
         return outcome.payload
     return JSONResponse(status_code=outcome.status_code, content=outcome.payload)
+
+
+def camera_chunk_error_payload(
+    error_code: str,
+    message: str,
+    *,
+    next_offset: int | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "accepted": False,
+        "error_code": error_code,
+        "message": message,
+    }
+    if next_offset is not None:
+        payload["next_offset"] = next_offset
+    return payload
+
+
+def camera_chunk_error_response(exc: CameraChunkError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=camera_chunk_error_payload(
+            exc.error_code,
+            exc.message,
+            next_offset=exc.next_offset,
+        ),
+    )
+
+
+def camera_chunk_log(
+    event: str,
+    *,
+    device_id: str,
+    request_id: str,
+    offset: int,
+    chunk_size: int,
+    received: int,
+    total: int,
+    next_offset: int,
+    stage_start: float,
+    result: str,
+    level: int = logging.INFO,
+) -> None:
+    logger.log(
+        level,
+        "%s device=%s request_id=%s offset=%d chunk_size=%d received=%d total=%d "
+        "next_offset=%d stage_ms=%.1f result=%s",
+        event,
+        device_id,
+        request_id,
+        offset,
+        chunk_size,
+        received,
+        total,
+        next_offset,
+        elapsed_ms(stage_start),
+        result,
+    )
+
+
+def parse_required_integer(value: str | None, name: str) -> int:
+    if value is None or not value.strip():
+        raise CameraChunkError(400, f"{name}_required", f"{name} query parameter is required")
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise CameraChunkError(400, f"invalid_{name}", f"{name} must be an integer") from exc
+
+
+def parse_camera_chunk_metadata(
+    request: Request,
+    *,
+    device: str | None,
+    request_id: str | None,
+    offset: str | None,
+    total: str | None,
+) -> CameraChunkRequestMetadata:
+    raw_device = (device or "").strip()
+    if not raw_device:
+        raise CameraChunkError(400, "device_required", "device query parameter is required")
+    normalized_request_id = (request_id or "").strip()
+    if not CAMERA_REQUEST_ID_PATTERN.fullmatch(normalized_request_id):
+        raise CameraChunkError(
+            400,
+            "invalid_request_id",
+            "request_id must contain 1-128 letters, digits, dot, underscore, colon or hyphen",
+        )
+    parsed_offset = parse_required_integer(offset, "offset")
+    parsed_total = parse_required_integer(total, "total")
+    if parsed_offset < 0:
+        raise CameraChunkError(400, "invalid_offset", "offset cannot be negative")
+    if parsed_total <= 0:
+        raise CameraChunkError(400, "invalid_total", "total must be positive")
+    if parsed_total > MAX_IMAGE_BYTES:
+        raise CameraChunkError(413, "total_too_large", "total exceeds the JPEG size limit")
+
+    raw_content_length = request.headers.get("content-length")
+    if raw_content_length is None:
+        raise CameraChunkError(400, "content_length_required", "Content-Length header is required")
+    try:
+        content_length = int(raw_content_length)
+    except ValueError as exc:
+        raise CameraChunkError(400, "invalid_content_length", "Content-Length must be an integer") from exc
+    if content_length <= 0:
+        raise CameraChunkError(400, "invalid_content_length", "chunk Content-Length must be positive")
+    if content_length > MAX_CHUNK_BYTES:
+        raise CameraChunkError(413, "chunk_too_large", "chunk exceeds the 4096 byte limit")
+    if parsed_offset + content_length > parsed_total:
+        raise CameraChunkError(
+            413,
+            "chunk_exceeds_total",
+            "chunk would make received bytes exceed total",
+        )
+    if parsed_offset + content_length < parsed_total and content_length != MAX_CHUNK_BYTES:
+        raise CameraChunkError(
+            400,
+            "non_final_chunk_size",
+            "every non-final chunk must contain exactly 4096 bytes",
+        )
+
+    content_type = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    if content_type != "application/octet-stream":
+        raise CameraChunkError(
+            400,
+            "invalid_content_type",
+            "chunk Content-Type must be application/octet-stream",
+        )
+    image_sha256 = (request.headers.get("x-image-sha256") or "").strip()
+    chunk_sha256 = (request.headers.get("x-chunk-sha256") or "").strip()
+    if not CAMERA_SHA256_PATTERN.fullmatch(image_sha256):
+        raise CameraChunkError(
+            400,
+            "invalid_image_sha256",
+            "X-Image-SHA256 must be 64 lowercase hexadecimal characters",
+        )
+    if not CAMERA_SHA256_PATTERN.fullmatch(chunk_sha256):
+        raise CameraChunkError(
+            400,
+            "invalid_chunk_sha256",
+            "X-Chunk-SHA256 must be 64 lowercase hexadecimal characters",
+        )
+    return CameraChunkRequestMetadata(
+        device_id=normalize_device_id(raw_device),
+        request_id=normalized_request_id,
+        offset=parsed_offset,
+        total=parsed_total,
+        content_length=content_length,
+        image_sha256=image_sha256,
+        chunk_sha256=chunk_sha256,
+    )
+
+
+async def read_camera_chunk_body(
+    request: Request,
+    expected_bytes: int,
+) -> bytes:
+    idle_timeout = positive_env_number("CAMERA_UPLOAD_IDLE_TIMEOUT_SECONDS", 8.0)
+    body = bytearray()
+    stream = request.stream().__aiter__()
+    while True:
+        try:
+            chunk = await asyncio.wait_for(anext(stream), timeout=idle_timeout)
+        except StopAsyncIteration:
+            break
+        except TimeoutError as exc:
+            raise CameraChunkError(408, "idle_timeout", "chunk upload timed out waiting for body data") from exc
+        except ClientDisconnect as exc:
+            raise CameraChunkError(400, "client_disconnected", "chunk upload disconnected before completion") from exc
+        if not chunk:
+            continue
+        body.extend(chunk)
+        if len(body) > MAX_CHUNK_BYTES:
+            raise CameraChunkError(413, "chunk_too_large", "chunk exceeds the 4096 byte limit")
+        if len(body) > expected_bytes:
+            raise CameraChunkError(400, "content_length_exceeded", "chunk exceeds Content-Length")
+    if len(body) != expected_bytes:
+        raise CameraChunkError(
+            400,
+            "content_length_mismatch",
+            "actual chunk body length does not match Content-Length",
+        )
+    return bytes(body)
+
+
+async def require_empty_request_body(request: Request) -> None:
+    raw_content_length = request.headers.get("content-length")
+    if raw_content_length is not None:
+        try:
+            content_length = int(raw_content_length)
+        except ValueError as exc:
+            raise CameraChunkError(400, "invalid_content_length", "Content-Length must be zero") from exc
+        if content_length != 0:
+            raise CameraChunkError(400, "body_not_empty", "request body must be empty")
+    stream = request.stream().__aiter__()
+    while True:
+        try:
+            chunk = await asyncio.wait_for(
+                anext(stream),
+                timeout=positive_env_number("CAMERA_UPLOAD_IDLE_TIMEOUT_SECONDS", 8.0),
+            )
+        except StopAsyncIteration:
+            return
+        except TimeoutError as exc:
+            raise CameraChunkError(408, "idle_timeout", "timed out waiting for request body") from exc
+        except ClientDisconnect:
+            return
+        if chunk:
+            raise CameraChunkError(400, "body_not_empty", "request body must be empty")
+
+
+def normalize_chunk_finish_outcome(outcome: CameraStoredOutcome) -> CameraStoredOutcome:
+    if 200 <= outcome.status_code < 300 or outcome.payload.get("accepted") is False:
+        return outcome
+    detail = outcome.payload.get("detail")
+    message = str(detail) if detail else "camera processing failed"
+    error_code = "vision_recognition_failed" if outcome.status_code == 502 else "camera_processing_failed"
+    return CameraStoredOutcome(
+        outcome.status_code,
+        camera_chunk_error_payload(error_code, message),
+    )
+
+
+async def persist_camera_chunk_outcome(
+    chunk_store: CameraChunkStore,
+    session: CameraChunkSession,
+    outcome: CameraStoredOutcome,
+    *,
+    stage_start: float,
+) -> CameraStoredOutcome:
+    try:
+        await asyncio.to_thread(chunk_store.complete, session.identity, outcome)
+    except Exception as exc:
+        camera_chunk_log(
+            "camera.upload.failed",
+            device_id=session.identity.device_id,
+            request_id=session.identity.request_id,
+            offset=session.received,
+            chunk_size=0,
+            received=session.received,
+            total=session.identity.total,
+            next_offset=session.received,
+            stage_start=stage_start,
+            result=f"result_persist_failed:{type(exc).__name__}",
+            level=logging.ERROR,
+        )
+        return CameraStoredOutcome(
+            500,
+            camera_chunk_error_payload(
+                "result_persist_failed",
+                "failed to persist camera finish result",
+            ),
+        )
+    camera_chunk_log(
+        "camera.upload.failed",
+        device_id=session.identity.device_id,
+        request_id=session.identity.request_id,
+        offset=session.received,
+        chunk_size=0,
+        received=session.received,
+        total=session.identity.total,
+        next_offset=session.received,
+        stage_start=stage_start,
+        result=str(outcome.payload.get("error_code") or "failed"),
+        level=logging.WARNING,
+    )
+    return outcome
 
 
 def keep_camera_task(task: asyncio.Task[CameraStoredOutcome]) -> None:
@@ -898,6 +1223,456 @@ async def upload_camera_image(
         use_vision=use_vision,
     )
     return camera_outcome_response(outcome)
+
+
+async def execute_camera_chunk_finish(
+    chunk_store: CameraChunkStore,
+    session: CameraChunkSession,
+    context: CameraLogContext,
+    image_bytes: bytes,
+) -> CameraStoredOutcome:
+    async def refresh_processing_lease() -> None:
+        interval = min(60.0, chunk_store.processing_lease_seconds / 3)
+        while True:
+            await asyncio.sleep(interval)
+            if not await asyncio.to_thread(
+                chunk_store.refresh_processing,
+                session.identity.request_id,
+            ):
+                return
+
+    identity = CameraRequestIdentity(
+        request_id=session.identity.request_id,
+        device_id=session.identity.device_id,
+        sha256=session.identity.image_sha256,
+        content_length=session.identity.total,
+    )
+    idempotency_store = get_camera_idempotency_store()
+    heartbeat = asyncio.create_task(refresh_processing_lease())
+    try:
+        outcome = await process_idempotent_camera_upload(
+            idempotency_store,
+            identity,
+            context,
+            image_bytes,
+            "image/jpeg",
+            artifact_id="",
+            vision_description=None,
+            use_vision=True,
+        )
+        claim = await asyncio.to_thread(idempotency_store.get, identity)
+        if claim is None or claim.outcome is None:
+            normalized_outcome = normalize_chunk_finish_outcome(outcome)
+            if outcome.status_code == 409:
+                await asyncio.to_thread(
+                    chunk_store.complete,
+                    session.identity,
+                    normalized_outcome,
+                )
+            return normalized_outcome
+
+        final_outcome = normalize_chunk_finish_outcome(claim.outcome)
+        await asyncio.to_thread(chunk_store.complete, session.identity, final_outcome)
+    finally:
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
+    camera_chunk_log(
+        "camera.finish.done",
+        device_id=session.identity.device_id,
+        request_id=session.identity.request_id,
+        offset=session.identity.total,
+        chunk_size=0,
+        received=session.received,
+        total=session.identity.total,
+        next_offset=session.received,
+        stage_start=context.total_start,
+        result="ready" if final_outcome.status_code == 200 else "failed",
+    )
+    return final_outcome
+
+
+@app.post("/camera/upload/chunk", response_model=None)
+async def upload_camera_chunk(
+    request: Request,
+    device: str | None = None,
+    request_id: str | None = None,
+    offset: str | None = None,
+    total: str | None = None,
+) -> object:
+    stage_start = perf_counter()
+    metadata: CameraChunkRequestMetadata | None = None
+    try:
+        metadata = parse_camera_chunk_metadata(
+            request,
+            device=device,
+            request_id=request_id,
+            offset=offset,
+            total=total,
+        )
+        chunk_bytes = await read_camera_chunk_body(request, metadata.content_length)
+        actual_chunk_sha256 = hashlib.sha256(chunk_bytes).hexdigest()
+        if actual_chunk_sha256 != metadata.chunk_sha256:
+            raise CameraChunkError(
+                422,
+                "chunk_sha256_mismatch",
+                "X-Chunk-SHA256 does not match the received chunk",
+            )
+        identity = CameraChunkIdentity(
+            request_id=metadata.request_id,
+            device_id=metadata.device_id,
+            total=metadata.total,
+            image_sha256=metadata.image_sha256,
+        )
+        result = await asyncio.to_thread(
+            get_camera_chunk_store().accept_chunk,
+            identity,
+            offset=metadata.offset,
+            chunk_bytes=chunk_bytes,
+            chunk_sha256=metadata.chunk_sha256,
+        )
+    except CameraChunkError as exc:
+        camera_chunk_log(
+            "camera.chunk.rejected",
+            device_id=metadata.device_id if metadata else normalize_device_id(device),
+            request_id=metadata.request_id if metadata else (request_id or "-"),
+            offset=metadata.offset if metadata else -1,
+            chunk_size=metadata.content_length if metadata else 0,
+            received=exc.next_offset or 0,
+            total=metadata.total if metadata else 0,
+            next_offset=exc.next_offset or 0,
+            stage_start=stage_start,
+            result=exc.error_code,
+            level=logging.WARNING,
+        )
+        return camera_chunk_error_response(exc)
+    except Exception as exc:
+        camera_chunk_log(
+            "camera.chunk.rejected",
+            device_id=metadata.device_id if metadata else normalize_device_id(device),
+            request_id=metadata.request_id if metadata else (request_id or "-"),
+            offset=metadata.offset if metadata else -1,
+            chunk_size=metadata.content_length if metadata else 0,
+            received=0,
+            total=metadata.total if metadata else 0,
+            next_offset=0,
+            stage_start=stage_start,
+            result=f"internal_error:{type(exc).__name__}",
+            level=logging.ERROR,
+        )
+        return JSONResponse(
+            status_code=500,
+            content=camera_chunk_error_payload("chunk_storage_failed", "failed to store camera chunk"),
+        )
+
+    session = result.session
+    event = "camera.chunk.duplicate" if result.action == "duplicate" else "camera.chunk.accepted"
+    camera_chunk_log(
+        event,
+        device_id=metadata.device_id,
+        request_id=metadata.request_id,
+        offset=metadata.offset,
+        chunk_size=metadata.content_length,
+        received=session.received,
+        total=metadata.total,
+        next_offset=session.received,
+        stage_start=stage_start,
+        result=result.action,
+    )
+    if session.received == metadata.total:
+        camera_chunk_log(
+            "camera.upload.complete",
+            device_id=metadata.device_id,
+            request_id=metadata.request_id,
+            offset=metadata.offset,
+            chunk_size=metadata.content_length,
+            received=session.received,
+            total=metadata.total,
+            next_offset=session.received,
+            stage_start=stage_start,
+            result="chunks_complete",
+        )
+    return {
+        "accepted": True,
+        "request_id": metadata.request_id,
+        "offset": metadata.offset,
+        "chunk_size": metadata.content_length,
+        "received": session.received,
+        "next_offset": session.received,
+        "complete": session.received == metadata.total,
+    }
+
+
+@app.post("/camera/upload/finish", response_model=None)
+async def finish_camera_chunk_upload(
+    request: Request,
+    device: str | None = None,
+    request_id: str | None = None,
+) -> object:
+    total_start = perf_counter()
+    raw_device = (device or "").strip()
+    normalized_request_id = (request_id or "").strip()
+    try:
+        if not raw_device:
+            raise CameraChunkError(400, "device_required", "device query parameter is required")
+        if not CAMERA_REQUEST_ID_PATTERN.fullmatch(normalized_request_id):
+            raise CameraChunkError(400, "invalid_request_id", "request_id is invalid")
+        image_sha256 = (request.headers.get("x-image-sha256") or "").strip()
+        if not CAMERA_SHA256_PATTERN.fullmatch(image_sha256):
+            raise CameraChunkError(
+                400,
+                "invalid_image_sha256",
+                "X-Image-SHA256 must be 64 lowercase hexadecimal characters",
+            )
+        await require_empty_request_body(request)
+        device_id = normalize_device_id(raw_device)
+        chunk_store = get_camera_chunk_store()
+        session = await asyncio.to_thread(
+            chunk_store.prepare_finish,
+            normalized_request_id,
+            device_id,
+            image_sha256,
+        )
+    except CameraChunkError as exc:
+        camera_chunk_log(
+            "camera.upload.failed",
+            device_id=normalize_device_id(raw_device),
+            request_id=normalized_request_id or "-",
+            offset=-1,
+            chunk_size=0,
+            received=exc.next_offset or 0,
+            total=0,
+            next_offset=exc.next_offset or 0,
+            stage_start=total_start,
+            result=exc.error_code,
+            level=logging.WARNING,
+        )
+        return camera_chunk_error_response(exc)
+    except Exception as exc:
+        camera_chunk_log(
+            "camera.upload.failed",
+            device_id=normalize_device_id(raw_device),
+            request_id=normalized_request_id or "-",
+            offset=-1,
+            chunk_size=0,
+            received=0,
+            total=0,
+            next_offset=0,
+            stage_start=total_start,
+            result=f"finish_prepare_failed:{type(exc).__name__}",
+            level=logging.ERROR,
+        )
+        return JSONResponse(
+            status_code=500,
+            content=camera_chunk_error_payload(
+                "finish_prepare_failed",
+                "failed to prepare camera finish",
+            ),
+        )
+
+    camera_chunk_log(
+        "camera.finish.start",
+        device_id=session.identity.device_id,
+        request_id=session.identity.request_id,
+        offset=session.received,
+        chunk_size=0,
+        received=session.received,
+        total=session.identity.total,
+        next_offset=session.received,
+        stage_start=total_start,
+        result=session.state,
+    )
+    if session.outcome is not None:
+        return camera_outcome_response(session.outcome)
+    if session.temp_path is None:
+        return camera_chunk_error_response(
+            CameraChunkError(500, "temporary_file_missing", "camera temporary file path is missing")
+        )
+
+    try:
+        image_bytes = await asyncio.to_thread(session.temp_path.read_bytes)
+    except OSError:
+        latest_session = await asyncio.to_thread(chunk_store.get, session.identity.request_id)
+        if latest_session is not None and latest_session.outcome is not None:
+            return camera_outcome_response(latest_session.outcome)
+        idempotency_identity = CameraRequestIdentity(
+            request_id=session.identity.request_id,
+            device_id=session.identity.device_id,
+            sha256=session.identity.image_sha256,
+            content_length=session.identity.total,
+        )
+        existing_claim = await asyncio.to_thread(
+            get_camera_idempotency_store().get,
+            idempotency_identity,
+        )
+        if existing_claim is not None and existing_claim.outcome is not None:
+            recovered = normalize_chunk_finish_outcome(existing_claim.outcome)
+            await asyncio.to_thread(chunk_store.complete, session.identity, recovered)
+            return camera_outcome_response(recovered)
+        return camera_chunk_error_response(
+            CameraChunkError(500, "temporary_file_read_failed", "failed to read camera temporary file")
+        )
+    if len(image_bytes) != session.identity.total:
+        outcome = CameraStoredOutcome(
+            409,
+            camera_chunk_error_payload(
+                "temporary_file_length_mismatch",
+                "temporary file length does not match total",
+                next_offset=session.received,
+            ),
+        )
+        return camera_outcome_response(
+            await persist_camera_chunk_outcome(
+                chunk_store,
+                session,
+                outcome,
+                stage_start=total_start,
+            )
+        )
+    actual_image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+    if actual_image_sha256 != session.identity.image_sha256:
+        outcome = CameraStoredOutcome(
+            422,
+            camera_chunk_error_payload(
+                "image_sha256_mismatch",
+                "complete JPEG SHA-256 does not match X-Image-SHA256",
+            ),
+        )
+        return camera_outcome_response(
+            await persist_camera_chunk_outcome(
+                chunk_store,
+                session,
+                outcome,
+                stage_start=total_start,
+            )
+        )
+    try:
+        validate_jpeg_upload(image_bytes, "image/jpeg")
+    except CameraUploadError as exc:
+        outcome = CameraStoredOutcome(
+            422,
+            camera_chunk_error_payload("invalid_jpeg", str(exc)),
+        )
+        return camera_outcome_response(
+            await persist_camera_chunk_outcome(
+                chunk_store,
+                session,
+                outcome,
+                stage_start=total_start,
+            )
+        )
+
+    context = CameraLogContext(
+        device_id=session.identity.device_id,
+        request_id=session.identity.request_id,
+        content_length=session.identity.total,
+        bytes_received=session.received,
+        sha256=session.identity.image_sha256,
+        total_start=total_start,
+        offset=session.received,
+        chunk_size=0,
+        next_offset=session.received,
+    )
+    task = asyncio.create_task(
+        execute_camera_chunk_finish(chunk_store, session, context, image_bytes)
+    )
+    keep_camera_task(task)
+    try:
+        outcome = await asyncio.shield(task)
+    except CameraChunkError as exc:
+        return camera_chunk_error_response(exc)
+    except Exception as exc:
+        camera_chunk_log(
+            "camera.upload.failed",
+            device_id=session.identity.device_id,
+            request_id=session.identity.request_id,
+            offset=session.received,
+            chunk_size=0,
+            received=session.received,
+            total=session.identity.total,
+            next_offset=session.received,
+            stage_start=total_start,
+            result=f"finish_internal_error:{type(exc).__name__}",
+            level=logging.ERROR,
+        )
+        return JSONResponse(
+            status_code=500,
+            content=camera_chunk_error_payload(
+                "finish_internal_error",
+                "camera finish processing failed",
+            ),
+        )
+    return camera_outcome_response(outcome)
+
+
+@app.post("/camera/upload/cancel", response_model=None)
+async def cancel_camera_chunk_upload(
+    device: str | None = None,
+    request_id: str | None = None,
+) -> object:
+    stage_start = perf_counter()
+    raw_device = (device or "").strip()
+    normalized_request_id = (request_id or "").strip()
+    try:
+        if not raw_device:
+            raise CameraChunkError(400, "device_required", "device query parameter is required")
+        if not CAMERA_REQUEST_ID_PATTERN.fullmatch(normalized_request_id):
+            raise CameraChunkError(400, "invalid_request_id", "request_id is invalid")
+        device_id = normalize_device_id(raw_device)
+        result = await asyncio.to_thread(
+            get_camera_chunk_store().cancel,
+            normalized_request_id,
+            device_id,
+        )
+    except CameraChunkError as exc:
+        camera_chunk_log(
+            "camera.upload.failed",
+            device_id=normalize_device_id(raw_device),
+            request_id=normalized_request_id or "-",
+            offset=-1,
+            chunk_size=0,
+            received=exc.next_offset or 0,
+            total=0,
+            next_offset=exc.next_offset or 0,
+            stage_start=stage_start,
+            result=exc.error_code,
+            level=logging.WARNING,
+        )
+        return camera_chunk_error_response(exc)
+    except Exception as exc:
+        camera_chunk_log(
+            "camera.upload.failed",
+            device_id=normalize_device_id(raw_device),
+            request_id=normalized_request_id or "-",
+            offset=-1,
+            chunk_size=0,
+            received=0,
+            total=0,
+            next_offset=0,
+            stage_start=stage_start,
+            result=f"cancel_failed:{type(exc).__name__}",
+            level=logging.ERROR,
+        )
+        return JSONResponse(
+            status_code=500,
+            content=camera_chunk_error_payload("cancel_failed", "failed to cancel camera upload"),
+        )
+
+    camera_chunk_log(
+        "camera.upload.cancelled",
+        device_id=device_id,
+        request_id=normalized_request_id,
+        offset=-1,
+        chunk_size=0,
+        received=0,
+        total=0,
+        next_offset=0,
+        stage_start=stage_start,
+        result=result,
+    )
+    return {"accepted": True}
 
 
 def raise_ai_http_error(exc: AiProtocolError) -> None:
