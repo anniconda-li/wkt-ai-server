@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import time
@@ -6,7 +7,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from openai import OpenAI
+
 from wav_utils import validate_device_wav
+
+
+DEFAULT_ASR_MODEL = "qwen3-asr-flash-2026-02-10"
+DEFAULT_ASR_FALLBACK_MODEL = "paraformer-realtime-v2"
+DASHSCOPE_COMPATIBLE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
 class AsrError(RuntimeError):
@@ -54,9 +62,11 @@ class DashScopeRealtimeCollector:
         return self.latest_text.strip()
 
 
-def transcribe_device_wav(
-    wav_path: Path,
+def transcribe_device_audio(
+    audio_path: Path,
     should_continue: Callable[[], bool] | None = None,
+    *,
+    fallback_wav_path: Path | None = None,
 ) -> AsrResult:
     mock_text = os.getenv("AI_MOCK_ASR_TEXT", "").strip()
     if mock_text:
@@ -64,9 +74,45 @@ def transcribe_device_wav(
 
     provider = os.getenv("ASR_PROVIDER", "dashscope").strip().lower()
     if provider == "dashscope":
-        return transcribe_dashscope_realtime(wav_path, should_continue=should_continue)
+        model = get_asr_model()
+        if model.startswith("qwen3-asr-flash") and "realtime" not in model:
+            try:
+                return transcribe_qwen_flash(audio_path, should_continue=should_continue)
+            except AsrCancelled:
+                raise
+            except AsrError as primary_error:
+                fallback_model = get_asr_fallback_model()
+                if not fallback_model or fallback_model == model:
+                    raise
+                wav_path = fallback_wav_path or audio_path
+                try:
+                    return transcribe_dashscope_realtime(
+                        wav_path,
+                        should_continue=should_continue,
+                        model=fallback_model,
+                    )
+                except AsrCancelled:
+                    raise
+                except AsrError as fallback_error:
+                    raise AsrError(
+                        f"Primary ASR {model} failed: {primary_error}; "
+                        f"fallback ASR {fallback_model} failed: {fallback_error}"
+                    ) from fallback_error
+        wav_path = fallback_wav_path or audio_path
+        return transcribe_dashscope_realtime(
+            wav_path,
+            should_continue=should_continue,
+            model=model,
+        )
 
     raise AsrConfigError(f"Unsupported ASR_PROVIDER: {provider}")
+
+
+def transcribe_device_wav(
+    wav_path: Path,
+    should_continue: Callable[[], bool] | None = None,
+) -> AsrResult:
+    return transcribe_device_audio(wav_path, should_continue=should_continue)
 
 
 def get_asr_api_key() -> str:
@@ -81,12 +127,132 @@ def get_asr_api_key() -> str:
 
 
 def get_asr_model() -> str:
-    return os.getenv("ASR_MODEL", "paraformer-realtime-v2").strip() or "paraformer-realtime-v2"
+    return os.getenv("ASR_MODEL", DEFAULT_ASR_MODEL).strip() or DEFAULT_ASR_MODEL
+
+
+def get_asr_fallback_model() -> str:
+    return os.getenv("ASR_FALLBACK_MODEL", DEFAULT_ASR_FALLBACK_MODEL).strip()
+
+
+def get_asr_base_url() -> str:
+    return (
+        os.getenv("ASR_BASE_URL")
+        or os.getenv("DASHSCOPE_BASE_URL")
+        or DASHSCOPE_COMPATIBLE_BASE_URL
+    ).strip().rstrip("/")
+
+
+def get_asr_language() -> str:
+    return os.getenv("ASR_LANGUAGE", "zh").strip() or "zh"
+
+
+def load_qwen_asr_options() -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "language": get_asr_language(),
+        "enable_itn": os.getenv("ASR_ENABLE_ITN", "false").strip().lower()
+        in {"1", "true", "yes", "on"},
+    }
+    extra_json = os.getenv("ASR_QWEN_OPTIONS_JSON", "").strip()
+    if not extra_json:
+        return options
+    try:
+        loaded = json.loads(extra_json)
+    except json.JSONDecodeError as exc:
+        raise AsrConfigError(f"ASR_QWEN_OPTIONS_JSON is invalid JSON: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise AsrConfigError("ASR_QWEN_OPTIONS_JSON must be a JSON object")
+    options.update(loaded)
+    return options
+
+
+def message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif hasattr(item, "text") and isinstance(item.text, str):
+                parts.append(item.text)
+        return "".join(parts).strip()
+    return str(content or "").strip()
+
+
+def transcribe_qwen_flash(
+    audio_path: Path,
+    should_continue: Callable[[], bool] | None = None,
+) -> AsrResult:
+    suffix = audio_path.suffix.lower()
+    mime_types = {
+        ".wav": "audio/wav",
+        ".ogg": "audio/ogg",
+        ".opus": "audio/ogg",
+    }
+    mime_type = mime_types.get(suffix)
+    if mime_type is None:
+        raise AsrError(f"Unsupported Qwen ASR audio file type: {suffix or '<none>'}")
+    if suffix == ".wav":
+        validate_device_wav(audio_path)
+    if should_continue is not None and not should_continue():
+        raise AsrCancelled("ASR cancelled")
+
+    max_bytes = int(os.getenv("ASR_QWEN_MAX_FILE_BYTES", str(10 * 1024 * 1024)))
+    audio_bytes = audio_path.read_bytes()
+    if len(audio_bytes) > max_bytes:
+        raise AsrError(
+            f"Qwen ASR input exceeds {max_bytes} bytes: {len(audio_bytes)} bytes"
+        )
+
+    client = OpenAI(
+        api_key=get_asr_api_key(),
+        base_url=get_asr_base_url(),
+        timeout=float(os.getenv("ASR_TIMEOUT_SECONDS", "60")),
+    )
+    data_uri = f"data:{mime_type};base64," + base64.b64encode(audio_bytes).decode("ascii")
+    model = get_asr_model()
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": data_uri},
+                        }
+                    ],
+                }
+            ],
+            stream=False,
+            extra_body={"asr_options": load_qwen_asr_options()},
+        )
+    except Exception as exc:
+        raise AsrError(f"DashScope Qwen ASR failed: {exc}") from exc
+
+    if should_continue is not None and not should_continue():
+        raise AsrCancelled("ASR cancelled")
+    if not response.choices:
+        raise AsrError("DashScope Qwen ASR returned no choices")
+
+    text = message_content_to_text(response.choices[0].message.content)
+    if not text:
+        raise AsrError("DashScope Qwen ASR returned empty text")
+    raw_response = response.model_dump(mode="json") if hasattr(response, "model_dump") else {}
+    return AsrResult(
+        text=text,
+        provider="dashscope",
+        model=model,
+        raw_events=[raw_response],
+    )
 
 
 def transcribe_dashscope_realtime(
     wav_path: Path,
     should_continue: Callable[[], bool] | None = None,
+    model: str | None = None,
 ) -> AsrResult:
     try:
         import dashscope
@@ -113,7 +279,7 @@ def transcribe_dashscope_realtime(
         def on_complete(self) -> None:
             collector.completed = True
 
-    model = get_asr_model()
+    model = model or get_asr_model()
     recognition_kwargs: dict[str, Any] = {
         "model": model,
         "format": "pcm",

@@ -115,10 +115,11 @@
 一次 ESP32 语音请求的协议流程：
 
 ```text
-设备 POST /ai/start，提交 device 和 language
+设备 POST /ai/start，提交 device、language 和可选 audio_format
   -> ai_protocol.py 创建语音 session，返回 session 和 chunk_size
-设备 POST /ai/upload 分片上传 WAV
-  -> ai_protocol.py 按 session + offset 写入 uploads/ai/{device}/{session}/request.wav
+设备 POST /ai/upload 分片上传 PCM WAV 或 AOP1 裸 Opus 帧
+  -> ai_protocol.py 按 session + offset 组装请求音频
+  -> AOP1 在服务端校验并封装成标准 Ogg/Opus，同时解码 WAV 供静音判断和 ASR 回退
 设备 POST /ai/finish
   -> 后端立即返回当前状态，并在后台处理 ASR / LLM / TTS
 设备 POST /ai/result_info 每秒轮询
@@ -141,7 +142,8 @@
 
 - `main.py` 负责 HTTP 接口。
 - `ai_protocol.py` 负责 ESP32 语音协议状态机。
-- `asr.py` 负责调用 DashScope Paraformer，把设备上传的 WAV 转成文字。
+- `asr.py` 负责调用 DashScope Qwen3-ASR，并在需要时回退到 Paraformer。
+- `opus_packets.py` 负责校验设备 AOP1 裸 Opus 帧并封装成标准 Ogg/Opus。
 - `pipeline.py` 负责本地文本到回答和 TTS WAV 的完整流水线。
 - `tts.py` 负责调用 TTS，并把返回音频统一成设备要求的 WAV。
 - `wav_utils.py` 负责校验设备要求的 WAV 格式。
@@ -199,7 +201,8 @@ DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 
 ```env
 VISION_PROVIDER=dashscope
-VISION_MODEL=qwen-vl-plus
+VISION_MODEL=qwen3.6-flash-2026-04-16
+VISION_ENABLE_THINKING=false
 VISION_MIN_CONFIDENCE=0.60
 MAX_SAVED_IMAGES_PER_DEVICE=10
 ```
@@ -215,7 +218,11 @@ MAX_SAVED_IMAGES_PER_DEVICE=10
 
 ```env
 ASR_PROVIDER=dashscope
-ASR_MODEL=paraformer-realtime-v2
+ASR_MODEL=qwen3-asr-flash-2026-02-10
+ASR_FALLBACK_MODEL=paraformer-realtime-v2
+ASR_LANGUAGE=zh
+ASR_ENABLE_ITN=false
+ASR_TIMEOUT_SECONDS=60
 # ASR_API_KEY 默认复用 DASHSCOPE_API_KEY
 ASR_FRAME_BYTES=3200
 ASR_FRAME_SLEEP_SECONDS=0
@@ -223,11 +230,13 @@ ASR_ARTIFACT_PHONETIC_THRESHOLD=0.86
 
 TTS_PROVIDER=dashscope
 TTS_API_STYLE=dashscope_qwen
-TTS_MODEL=qwen3-tts-flash
+TTS_MODEL=qwen3-tts-flash-2025-11-27
 TTS_VOICE=Cherry
 TTS_LANGUAGE_TYPE=Chinese
 TTS_TIMEOUT_SECONDS=120
 ```
+
+当前设备在 `/ai/finish` 后处理完整请求音频（PCM WAV 或 AOP1/Opus），因此主 ASR 使用同步短音频模型。主模型请求失败时会自动回退到 `ASR_FALLBACK_MODEL`；将该变量留空可以关闭回退。Qwen3-ASR 单文件限制为 5 分钟、10 MB，超过设备协议约束的音频会在调用前失败。
 
 `TTS_API_KEY` 默认复用 `DASHSCOPE_API_KEY`。Qwen3-TTS 默认请求百炼公共 API：
 
@@ -253,9 +262,10 @@ FFMPEG_BIN=D:\tools\ffmpeg\bin\ffmpeg.exe
 
 ```text
 DeepSeek / OPENAI_MODEL      -> 文本讲解和问答
-Qwen-VL / VISION_MODEL       -> 图片识别，输出 artifact_id
-Paraformer / ASR_MODEL       -> 语音转文字
-Qwen3-TTS / TTS_MODEL        -> 文字转语音，输出 ESP32 标准 WAV
+Qwen3-VL / VISION_MODEL            -> 图片识别，输出 artifact_id
+Qwen3-ASR / ASR_MODEL              -> 完整音频语音转文字
+Paraformer / ASR_FALLBACK_MODEL    -> 主 ASR 失败时回退
+Qwen3-TTS / TTS_MODEL              -> 文字转语音，输出 ESP32 标准 WAV
 ```
 
 OpenAI 官方示例：
@@ -667,7 +677,7 @@ AI> 它是平顶山“鹰城”文化的重要象征……
 
 相机图片上传接口。接口会保存 JPEG，并根据请求参数决定识别方式：
 
-- 不传 `artifact_id`：调用 `VISION_MODEL`，当前推荐 `qwen-vl-plus`。
+- 不传 `artifact_id`：调用 `VISION_MODEL`，当前使用 `qwen3.6-flash-2026-04-16`，关闭思考并要求 JSON 输出。
 - 传 `artifact_id`：跳过视觉模型，把它当作人工指定的模拟识别结果，方便对照测试。
 - 传 `use_vision=false`：只保存图片，不识别，并清空该设备旧的 `latest_artifact_id`。
 
@@ -765,31 +775,31 @@ AI> 这是应国玉鹰……
 
 ### POST /ai/start
 
-ESP32 语音协议入口。当前后端已经实现分片保存、ASR、LLM、TTS、轮询状态、取消语义和 `result_chunk` 原始 WAV 返回。设备端仍然只需要 HTTP POST；后端内部用 DashScope Paraformer 把 WAV 转成文字，再继续走现有问答和 TTS 链路。
+ESP32 语音协议入口。请求上行兼容旧的 PCM WAV 和新的 AOP1 裸 Opus 帧；回复下行仍为 PCM WAV。
 
 请求：
 
 ```json
-{"device":"walkie-02","language":"zh"}
+{"device":"walkie-02","language":"zh","audio_format":"opus_packets_v1"}
 ```
 
 响应：
 
 ```json
-{"session":"abc123","chunk_size":8192}
+{"ok":true,"session":"abc123","audio_format":"opus_packets_v1","chunk_size":32768}
 ```
 
 后端会用 `device` 绑定语音 session。后续 `/ai/upload`、`/ai/finish`、`/ai/result_info`、`/ai/result_chunk` 即使只传 `session` 也能找到设备上下文；如果设备端额外带 `device=walkie-02`，后端会校验它和 session 里的设备是否一致。
 
 ### POST /ai/upload
 
-上传请求 WAV 分片。所有接口都用 POST。
+上传请求音频分片。`audio_format` 省略时按旧的 `pcm_wav` 处理；新设备使用 `opus_packets_v1`。
 
 ```text
-POST /ai/upload?session=abc123&device=walkie-02&index=0&offset=0&total=1920044
-Content-Type: application/octet-stream
+POST /ai/upload?session=abc123&device=walkie-02&index=0&offset=0&total=156024
+Content-Type: application/vnd.wkt.opus-packets
 
-<WAV bytes chunk>
+<AOP1 bytes chunk>
 ```
 
 响应：
@@ -798,7 +808,11 @@ Content-Type: application/octet-stream
 {"ok":true}
 ```
 
-后端按 `session + offset` 写入文件，当前最大请求 WAV 约 2.1 MB。设备 WAV 必须保持：
+后端按 `session + offset` 写入文件，分片不必与 Opus 包边界对齐。AOP1 最大 256 KiB，格式为 24 字节小端文件头，之后循环保存 `uint16 packet_len + raw Opus packet`。固定参数为 16 kHz、单声道、320 samples/20 ms，每包最大 1275 字节，最长 3000 帧/60 秒。
+
+AOP1 会额外解码一份 WAV 用于静音检测和 Paraformer 回退，因此传统 Python 启动也需要本机 `PATH` 中存在 `ffmpeg`，或通过 `FFMPEG_BIN` 指定；Docker 镜像已经安装。
+
+旧设备的 PCM WAV 最大约 2.1 MB，并继续使用 `application/octet-stream`：
 
 ```text
 Container: WAV
@@ -819,9 +833,9 @@ POST /ai/finish?session=abc123&device=walkie-02
 
 当前版本的处理策略：
 
-- 如果 WAV 无效，返回 `failed`。
-- 如果 WAV 太短或接近静音，返回 `no_speech`，`answer_text` 默认为“我没有听清，请再说一遍。”。
-- 有效语音会调用 `asr.py` 中的 DashScope Paraformer 识别，识别文本写入 `asr_text`。
+- 如果 WAV 或 AOP1 无效，返回 `failed`。
+- 如果音频太短或接近静音，返回 `no_speech`，`answer_text` 默认为“我没有听清，请再说一遍。”。
+- AOP1 会无损封装为 Ogg/Opus；Qwen3-ASR 直接接收 Ogg，Paraformer 回退使用服务端解码的 WAV。
 - ASR 文本进入 LLM 前会经过 `text_normalize.py` 的文物名拼音近似纠错，例如“英国玉婴”“应国玉英”会修正为“应国玉鹰”，再进行本地知识卡匹配。
 - 如果 ASR 配置错误或服务调用失败，返回 `failed`，并通过 `answer_text` 给设备一段可显示的错误提示，避免设备一直轮询。
 - 如果配置了 `AI_MOCK_ASR_TEXT`，后端会跳过真实 ASR，用这段文本调用现有 LLM 编排。

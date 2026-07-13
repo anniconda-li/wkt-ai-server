@@ -57,7 +57,7 @@ logger = logging.getLogger("wkt_ai_server.main")
 
 app = FastAPI(
     title="wkt-ai-server",
-    description="Walkie-talkie AI voice, ASR, TTS, WAV chunking, and camera analysis service.",
+    description="Walkie-talkie AI voice, ASR, TTS, WAV/Opus chunking, and camera analysis service.",
     version="0.1.0",
 )
 
@@ -80,6 +80,7 @@ class ArtifactContextRequest(BaseModel):
 class AiStartRequest(BaseModel):
     device: str
     language: str = "zh"
+    audio_format: str = "pcm_wav"
 
 
 @app.get("/health")
@@ -328,8 +329,16 @@ def raise_ai_http_error(exc: AiProtocolError) -> None:
 
 @app.post("/ai/start")
 async def ai_start(request: AiStartRequest) -> dict[str, object]:
-    session = create_ai_session(request.device, request.language)
-    return {"session": session.session_id, "chunk_size": AI_CHUNK_SIZE}
+    try:
+        session = create_ai_session(request.device, request.language, request.audio_format)
+        return {
+            "ok": True,
+            "session": session.session_id,
+            "audio_format": session.audio_format,
+            "chunk_size": AI_CHUNK_SIZE,
+        }
+    except AiProtocolError as exc:
+        raise_ai_http_error(exc)
 
 
 @app.post("/ai/upload")
@@ -350,6 +359,7 @@ async def ai_upload(
             offset=offset,
             total=total,
             device=device,
+            content_type=request.headers.get("content-type"),
         )
     except AiProtocolError as exc:
         raise_ai_http_error(exc)

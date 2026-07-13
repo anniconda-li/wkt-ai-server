@@ -83,8 +83,8 @@ docker compose config
 | `GET` | `/artifacts` | 文物知识卡摘要列表 |
 | `GET` | `/artifacts/{artifact_id}` | 文物知识卡详情 |
 | `POST` | `/camera/upload` | raw JPEG body；query：`device`、可选 `artifact_id`、`vision_description`、`use_vision` |
-| `POST` | `/ai/start` | JSON：`device`、`language`；返回 session 和 `chunk_size=8192` |
-| `POST` | `/ai/upload` | raw WAV chunk；query：`session`、`index`、`offset`、`total`、可选 `device` |
+| `POST` | `/ai/start` | JSON：`device`、`language`、可选 `audio_format`；返回 session、确认格式和 `chunk_size=32768` |
+| `POST` | `/ai/upload` | raw WAV 或 AOP1 chunk；query：`session`、`index`、`offset`、`total`、可选 `device` |
 | `POST` | `/ai/finish` | query：`session`、可选 `device`；后台启动 ASR/LLM/TTS |
 | `POST` | `/ai/result_info` | query：`session`、可选 `device`；轮询处理状态 |
 | `POST` | `/ai/result_chunk` | query：`session`、`offset`、`len`、可选 `device`；返回 `audio/wav` |
@@ -105,16 +105,19 @@ docker compose config
 | 文本 LLM | `OPENAI_BASE_URL` | OpenAI-compatible endpoint，可选 |
 | 百炼共享 | `DASHSCOPE_API_KEY` | 视觉、ASR、TTS 使用百炼时必填，可被各模块 key 覆盖 |
 | 百炼共享 | `DASHSCOPE_BASE_URL` | OpenAI-compatible 百炼 endpoint，可选 |
-| 视觉 | `VISION_PROVIDER`, `VISION_MODEL` | `dashscope`, `qwen-vl-plus` |
+| 视觉 | `VISION_PROVIDER`, `VISION_MODEL` | `dashscope`, `qwen3.6-flash-2026-04-16` |
 | 视觉 | `VISION_API_KEY`, `VISION_BASE_URL` | 可选；默认复用百炼配置 |
+| 视觉 | `VISION_ENABLE_THINKING` | `false`，降低延迟并稳定 JSON 输出 |
 | 视觉 | `VISION_MIN_CONFIDENCE` | `0.60` |
 | 图片保存 | `MAX_SAVED_IMAGES_PER_DEVICE` | `10`，最小按 1 处理 |
-| ASR | `ASR_PROVIDER`, `ASR_MODEL` | `dashscope`, `paraformer-realtime-v2` |
+| ASR | `ASR_PROVIDER`, `ASR_MODEL` | `dashscope`, `qwen3-asr-flash-2026-02-10` |
+| ASR | `ASR_FALLBACK_MODEL` | `paraformer-realtime-v2`；留空禁用回退 |
 | ASR | `ASR_API_KEY` | 可选；默认复用 `DASHSCOPE_API_KEY` |
+| ASR | `ASR_LANGUAGE`, `ASR_ENABLE_ITN`, `ASR_TIMEOUT_SECONDS` | `zh`, `false`, `60` |
 | ASR | `ASR_FRAME_BYTES`, `ASR_FRAME_SLEEP_SECONDS` | `3200`, `0` |
 | ASR | `ASR_EXTRA_KWARGS` | 可选 JSON 对象 |
 | ASR 纠错 | `ASR_ARTIFACT_PHONETIC_THRESHOLD` | `0.86` |
-| TTS | `TTS_PROVIDER`, `TTS_API_STYLE`, `TTS_MODEL` | `dashscope`, 自动推断/示例为 `dashscope_qwen`, `qwen3-tts-flash` |
+| TTS | `TTS_PROVIDER`, `TTS_API_STYLE`, `TTS_MODEL` | `dashscope`, 自动推断/示例为 `dashscope_qwen`, `qwen3-tts-flash-2025-11-27` |
 | TTS | `TTS_API_KEY` | 可选；依次复用 `DASHSCOPE_API_KEY`、`OPENAI_API_KEY` |
 | TTS | `TTS_BASE_URL`, `DASHSCOPE_TTS_BASE_URL`, `TTS_ENDPOINT` | 可选 endpoint 覆盖项 |
 | TTS | `TTS_VOICE`, `TTS_LANGUAGE_TYPE`, `TTS_RESPONSE_FORMAT` | `Cherry`, `Chinese`, `wav` |
@@ -131,7 +134,7 @@ docker compose config
 | 链路 | 应用限制 | 部署层要求 |
 | --- | --- | --- |
 | `/camera/upload` | JPEG 最小 128 字节，最大 8 MiB | 反向代理请求体上限至少 8 MiB；建议配置 9 MiB 预留开销 |
-| `/ai/upload` | 单个会话声明的 WAV 总大小最大 2,100,000 字节；服务端建议分片 8,192 字节 | 不合并或改写 query 参数和 raw body |
+| `/ai/upload` | PCM WAV 最大 2,100,000 字节；AOP1 Opus 最大 262,144 字节；建议分片 32,768 字节 | 允许 `application/octet-stream` 和 `application/vnd.wkt.opus-packets`，不改写 query 或 raw body |
 | `/ai/result_chunk` | 单次最多返回 32,768 字节 | 允许 `audio/wav` 二进制响应 |
 | TTS 回复 WAV | 最大 4,000,000 字节 | `/app/uploads` 需要足够磁盘空间 |
 | `/chat` | 流式纯文本响应 | 禁用代理响应缓冲，空闲/读取超时至少 120 秒 |

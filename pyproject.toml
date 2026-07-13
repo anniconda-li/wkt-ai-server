@@ -1,14 +1,14 @@
 [project]
 name = "wkt-ai-server"
 version = "0.1.0"
-description = "Independent AI voice, ASR, TTS, WAV chunking, and camera analysis backend."
+description = "Independent AI voice, ASR, TTS, WAV/Opus chunking, and camera analysis backend."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
-    "openai>=1.40.0",
+    "openai>=1.52.0",
     "python-dotenv>=1.0.1",
     "dashscope>=1.20.0",
     "pypinyin>=0.51.0",

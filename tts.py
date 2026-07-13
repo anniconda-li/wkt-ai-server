@@ -9,6 +9,7 @@ from wav_utils import WavFormatError, convert_audio_to_device_wav, validate_devi
 
 
 DEFAULT_TTS_ENDPOINT_PATH = "/audio/speech"
+DEFAULT_TTS_MODEL = "qwen3-tts-flash-2025-11-27"
 DASHSCOPE_QWEN_TTS_ENDPOINT = (
     "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 )
@@ -92,7 +93,7 @@ def get_tts_api_style() -> str:
 
 
 def request_openai_compatible_tts(text: str) -> bytes:
-    model = os.getenv("TTS_MODEL", "qwen3-tts-flash").strip()
+    model = os.getenv("TTS_MODEL", DEFAULT_TTS_MODEL).strip()
     voice = os.getenv("TTS_VOICE", "Cherry").strip()
     response_format = os.getenv("TTS_RESPONSE_FORMAT", "wav").strip() or "wav"
     timeout = float(os.getenv("TTS_TIMEOUT_SECONDS", "120"))
@@ -149,7 +150,7 @@ def get_dashscope_tts_base_url() -> str:
 
 
 def request_dashscope_qwen_tts(text: str) -> bytes:
-    model = os.getenv("TTS_MODEL", "qwen3-tts-flash").strip()
+    model = os.getenv("TTS_MODEL", DEFAULT_TTS_MODEL).strip()
     voice = os.getenv("TTS_VOICE", "Cherry").strip()
     language_type = os.getenv("TTS_LANGUAGE_TYPE", "Chinese").strip() or "Chinese"
     timeout = float(os.getenv("TTS_TIMEOUT_SECONDS", "120"))
