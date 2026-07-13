@@ -205,6 +205,9 @@ VISION_MODEL=qwen3.6-flash-2026-04-16
 VISION_ENABLE_THINKING=false
 VISION_MIN_CONFIDENCE=0.60
 MAX_SAVED_IMAGES_PER_DEVICE=10
+CAMERA_UPLOAD_IDLE_TIMEOUT_SECONDS=8
+CAMERA_UPLOAD_TOTAL_TIMEOUT_SECONDS=30
+CAMERA_UPLOAD_PROGRESS_LOG_BYTES=4096
 ```
 
 一般不需要单独写 `VISION_API_KEY` 或 `VISION_BASE_URL`，它们会默认复用 `DASHSCOPE_API_KEY` 和 `DASHSCOPE_BASE_URL`。只有当视觉模型想换到另一个服务商或另一个百炼 endpoint 时，才需要覆盖：
@@ -350,7 +353,8 @@ Compose 保持现有 `8000` 端口和 `.env` 配置方式。详细说明见 [`do
 图片上传链路会看到类似日志：
 
 ```text
-2026-07-05 18:20:01 INFO [wkt_ai_server.main] camera.upload.start device=walkie-01 manual_artifact=False use_vision=True content_type=image/jpeg
+2026-07-05 18:20:01 INFO [wkt_ai_server.main] camera.upload.start device=walkie-01 manual_artifact=False use_vision=True content_type=image/jpeg content_length=14088
+2026-07-05 18:20:01 INFO [wkt_ai_server.main] camera.upload.receive device=walkie-01 chunk_bytes=4096 received=4096 expected=14088 ms=1.0
 2026-07-05 18:20:01 INFO [wkt_ai_server.main] camera.upload.stage read_body_ms=1.2 bytes=14088
 2026-07-05 18:20:01 INFO [wkt_ai_server.main] camera.upload.stage save_image_ms=3.4 image_id=... size_bytes=14088
 2026-07-05 18:20:03 INFO [vision_llm] vision.recognition.stage api_call_ms=1820.5
@@ -369,6 +373,7 @@ Compose 保持现有 `8000` 端口和 `.env` 配置方式。详细说明见 [`do
 重点看这几个字段：
 
 - `api_call_ms`：视觉模型本身耗时，通常是图片识别最慢的部分。
+- `camera.upload.receive`：服务端实际收到的请求体进度；如果停止增长，模型尚未被调用。
 - `recognition_ms`：整个识别阶段耗时，包含模型调用和本地解析。
 - `first_token_ms`：聊天首 token 延迟，决定用户感觉“等了多久才开始说话”。
 - `total_ms`：接口总耗时。
@@ -687,9 +692,16 @@ AI> 它是平顶山“鹰城”文化的重要象征……
 
 ```env
 MAX_SAVED_IMAGES_PER_DEVICE=10
+CAMERA_UPLOAD_IDLE_TIMEOUT_SECONDS=8
+CAMERA_UPLOAD_TOTAL_TIMEOUT_SECONDS=30
+CAMERA_UPLOAD_PROGRESS_LOG_BYTES=4096
 ```
 
 清理只针对 `uploads/{device_id}/` 下的 `.jpg` 图片，不会影响语音请求和回复 WAV。
+
+后端会流式接收 raw JPEG，并校验声明的 `Content-Length` 和实际字节数。连续 8 秒没有收到新字节时返回 HTTP 408，整次请求体接收最多等待 30 秒；两项均可通过上述环境变量调整。`CAMERA_UPLOAD_PROGRESS_LOG_BYTES` 控制 INFO 日志的进度间隔，默认每累计 4096 字节记录一次，便于区分设备/TCP 停发和服务端未消费。请求体超过 8 MiB 会返回 HTTP 413，客户端中途断连或长度不符会返回 HTTP 400。
+
+接收阶段的错误响应会携带 `reason / message / received_bytes / expected_bytes`，并发送 `Connection: close`，避免半包请求残留在 HTTP keep-alive 连接中。设备端应把 HTTP 408 视为本次上传失败并重新建立连接，最多重试一次完整 JPEG；不要从中断偏移继续发送。
 
 接口形态特意使用 raw JPEG body，而不是 multipart。这样以后 ESP32 C 端更容易对齐：HTTP body 直接发送 JPEG 字节即可。
 

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from time import perf_counter
@@ -5,6 +6,7 @@ from time import perf_counter
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
+from starlette.requests import ClientDisconnect
 
 from ai_protocol import (
     AI_CHUNK_SIZE,
@@ -30,6 +32,7 @@ from sessions import (
     set_image_context,
 )
 from vision import (
+    MAX_IMAGE_BYTES,
     CameraUploadError,
     build_manual_vision_result,
     build_unrecognized_vision_result,
@@ -64,6 +67,164 @@ app = FastAPI(
 
 def elapsed_ms(start: float) -> float:
     return (perf_counter() - start) * 1000
+
+
+class CameraUploadReadError(RuntimeError):
+    def __init__(
+        self,
+        status_code: int,
+        reason: str,
+        detail: str,
+        *,
+        received_bytes: int = 0,
+        expected_bytes: int | None = None,
+    ) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.reason = reason
+        self.detail = detail
+        self.received_bytes = received_bytes
+        self.expected_bytes = expected_bytes
+
+
+def positive_env_number(name: str, default: float) -> float:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        value = float(raw_value)
+    except ValueError:
+        logger.warning("config.invalid_number name=%s value=%r default=%s", name, raw_value, default)
+        return default
+    if value <= 0:
+        logger.warning("config.non_positive_number name=%s value=%r default=%s", name, raw_value, default)
+        return default
+    return value
+
+
+def camera_content_length(request: Request) -> int | None:
+    raw_value = request.headers.get("content-length")
+    if raw_value is None:
+        return None
+    try:
+        content_length = int(raw_value)
+    except ValueError as exc:
+        raise CameraUploadReadError(
+            400,
+            "invalid_content_length",
+            "invalid Content-Length header",
+        ) from exc
+    if content_length < 0:
+        raise CameraUploadReadError(
+            400,
+            "invalid_content_length",
+            "invalid Content-Length header",
+            expected_bytes=content_length,
+        )
+    if content_length > MAX_IMAGE_BYTES:
+        raise CameraUploadReadError(
+            413,
+            "content_length_too_large",
+            f"camera upload exceeds {MAX_IMAGE_BYTES} byte limit",
+            expected_bytes=content_length,
+        )
+    return content_length
+
+
+async def read_camera_upload_body(request: Request, device_id: str) -> bytes:
+    expected_bytes = camera_content_length(request)
+    idle_timeout = positive_env_number("CAMERA_UPLOAD_IDLE_TIMEOUT_SECONDS", 8.0)
+    total_timeout = positive_env_number("CAMERA_UPLOAD_TOTAL_TIMEOUT_SECONDS", 30.0)
+    progress_bytes = max(
+        1,
+        int(positive_env_number("CAMERA_UPLOAD_PROGRESS_LOG_BYTES", 4096)),
+    )
+    start = perf_counter()
+    received_bytes = 0
+    next_progress = progress_bytes
+    logged_first_chunk = False
+    body = bytearray()
+    stream = request.stream().__aiter__()
+
+    while True:
+        remaining_total = total_timeout - (perf_counter() - start)
+        if remaining_total <= 0:
+            raise CameraUploadReadError(
+                408,
+                "total_timeout",
+                "camera upload timed out",
+                received_bytes=received_bytes,
+                expected_bytes=expected_bytes,
+            )
+
+        wait_timeout = min(idle_timeout, remaining_total)
+        timeout_reason = "total_timeout" if remaining_total <= idle_timeout else "idle_timeout"
+        try:
+            chunk = await asyncio.wait_for(anext(stream), timeout=wait_timeout)
+        except StopAsyncIteration:
+            break
+        except TimeoutError as exc:
+            raise CameraUploadReadError(
+                408,
+                timeout_reason,
+                "camera upload timed out while waiting for request body",
+                received_bytes=received_bytes,
+                expected_bytes=expected_bytes,
+            ) from exc
+        except ClientDisconnect as exc:
+            raise CameraUploadReadError(
+                400,
+                "client_disconnected",
+                "camera upload disconnected before request body completed",
+                received_bytes=received_bytes,
+                expected_bytes=expected_bytes,
+            ) from exc
+
+        if not chunk:
+            continue
+        received_bytes += len(chunk)
+        if received_bytes > MAX_IMAGE_BYTES:
+            raise CameraUploadReadError(
+                413,
+                "body_too_large",
+                f"camera upload exceeds {MAX_IMAGE_BYTES} byte limit",
+                received_bytes=received_bytes,
+                expected_bytes=expected_bytes,
+            )
+        if expected_bytes is not None and received_bytes > expected_bytes:
+            raise CameraUploadReadError(
+                400,
+                "content_length_exceeded",
+                "camera upload body exceeds declared Content-Length",
+                received_bytes=received_bytes,
+                expected_bytes=expected_bytes,
+            )
+        body.extend(chunk)
+
+        if (
+            not logged_first_chunk
+            or received_bytes >= next_progress
+            or (expected_bytes is not None and received_bytes == expected_bytes)
+        ):
+            logger.info(
+                "camera.upload.receive device=%s chunk_bytes=%d received=%d expected=%s ms=%.1f",
+                device_id,
+                len(chunk),
+                received_bytes,
+                expected_bytes,
+                elapsed_ms(start),
+            )
+            logged_first_chunk = True
+            while next_progress <= received_bytes:
+                next_progress += progress_bytes
+
+    if expected_bytes is not None and received_bytes != expected_bytes:
+        raise CameraUploadReadError(
+            400,
+            "content_length_mismatch",
+            "camera upload body length does not match Content-Length",
+            received_bytes=received_bytes,
+            expected_bytes=expected_bytes,
+        )
+    return bytes(body)
 
 
 class ChatRequest(BaseModel):
@@ -167,11 +328,13 @@ async def upload_camera_image(
     device_id = normalize_device_id(device)
     normalized_artifact_id = (artifact_id or "").strip()
     logger.info(
-        "camera.upload.start device=%s manual_artifact=%s use_vision=%s content_type=%s",
+        "camera.upload.start device=%s manual_artifact=%s use_vision=%s "
+        "content_type=%s content_length=%s",
         device_id,
         bool(normalized_artifact_id),
         use_vision,
         request.headers.get("content-type"),
+        request.headers.get("content-length"),
     )
 
     lookup_start = perf_counter()
@@ -188,7 +351,29 @@ async def upload_camera_image(
     )
 
     read_start = perf_counter()
-    image_bytes = await request.body()
+    try:
+        image_bytes = await read_camera_upload_body(request, device_id)
+    except CameraUploadReadError as exc:
+        logger.warning(
+            "camera.upload.failed device=%s stage=read_body reason=%s received=%d "
+            "expected=%s error=%s total_ms=%.1f",
+            device_id,
+            exc.reason,
+            exc.received_bytes,
+            exc.expected_bytes,
+            exc.detail,
+            elapsed_ms(total_start),
+        )
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "reason": exc.reason,
+                "message": exc.detail,
+                "received_bytes": exc.received_bytes,
+                "expected_bytes": exc.expected_bytes,
+            },
+            headers={"Connection": "close"},
+        ) from exc
     logger.info(
         "camera.upload.stage read_body_ms=%.1f bytes=%d",
         elapsed_ms(read_start),

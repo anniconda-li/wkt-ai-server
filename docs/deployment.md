@@ -110,6 +110,9 @@ docker compose config
 | 视觉 | `VISION_ENABLE_THINKING` | `false`，降低延迟并稳定 JSON 输出 |
 | 视觉 | `VISION_MIN_CONFIDENCE` | `0.60` |
 | 图片保存 | `MAX_SAVED_IMAGES_PER_DEVICE` | `10`，最小按 1 处理 |
+| 图片上传 | `CAMERA_UPLOAD_IDLE_TIMEOUT_SECONDS` | `8`，连续无新字节时返回 HTTP 408 |
+| 图片上传 | `CAMERA_UPLOAD_TOTAL_TIMEOUT_SECONDS` | `30`，请求体接收总时间上限 |
+| 图片上传 | `CAMERA_UPLOAD_PROGRESS_LOG_BYTES` | `4096`，INFO 接收进度日志间隔 |
 | ASR | `ASR_PROVIDER`, `ASR_MODEL` | `dashscope`, `qwen3-asr-flash-2026-02-10` |
 | ASR | `ASR_FALLBACK_MODEL` | `paraformer-realtime-v2`；留空禁用回退 |
 | ASR | `ASR_API_KEY` | 可选；默认复用 `DASHSCOPE_API_KEY` |
@@ -133,7 +136,7 @@ docker compose config
 
 | 链路 | 应用限制 | 部署层要求 |
 | --- | --- | --- |
-| `/camera/upload` | JPEG 最小 128 字节，最大 8 MiB | 反向代理请求体上限至少 8 MiB；建议配置 9 MiB 预留开销 |
+| `/camera/upload` | JPEG 最小 128 字节，最大 8 MiB；校验 `Content-Length`；默认空闲 8 秒、总计 30 秒接收超时 | 反向代理请求体上限至少 8 MiB；建议配置 9 MiB 预留开销；读取超时应大于应用总超时 |
 | `/ai/upload` | PCM WAV 最大 2,100,000 字节；AOP1 Opus 最大 262,144 字节；建议分片 32,768 字节 | 允许 `application/octet-stream` 和 `application/vnd.wkt.opus-packets`，不改写 query 或 raw body |
 | `/ai/result_chunk` | 单次最多返回 32,768 字节 | 允许 `audio/wav` 二进制响应 |
 | TTS 回复 WAV | 最大 4,000,000 字节 | `/app/uploads` 需要足够磁盘空间 |
