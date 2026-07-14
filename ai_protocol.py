@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
+from typing import Callable
 from uuid import uuid4
 
 from asr import AsrCancelled, AsrConfigError, AsrError, transcribe_device_audio
@@ -65,6 +66,7 @@ class AiSession:
     cancel_requested: bool = False
     audio_stopped: bool = False
     task: asyncio.Task[None] | None = field(default=None, repr=False)
+    status_callback: Callable[["AiSession"], None] | None = field(default=None, repr=False)
     created_at: str = field(default_factory=lambda: now_iso())
     updated_at: str = field(default_factory=lambda: now_iso())
 
@@ -98,10 +100,17 @@ def create_ai_session(
     device: str | None,
     language: str | None = "zh",
     audio_format: str | None = AI_AUDIO_FORMAT_WAV,
+    *,
+    session_id: str | None = None,
 ) -> AiSession:
     device_id = normalize_device_id(device)
     normalized_format = normalize_audio_format(audio_format)
-    session_id = uuid4().hex
+    session_id = session_id or uuid4().hex
+    existing = ai_sessions.get(session_id)
+    if existing is not None:
+        if existing.device_id != device_id or existing.audio_format != normalized_format:
+            raise AiProtocolError(409, "session id conflicts with an existing AI session")
+        return existing
     session_dir = AI_ROOT / device_id / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
     request_audio_path = (
@@ -154,6 +163,16 @@ def set_status(session: AiSession, status: str, *, error: str | None = None) -> 
     session.status = status
     session.error = error
     session.touch()
+    if session.status_callback is not None:
+        try:
+            session.status_callback(session)
+        except Exception as exc:
+            logger.warning(
+                "ai.status_callback.failed session=%s status=%s error=%s",
+                session.session_id,
+                status,
+                type(exc).__name__,
+            )
 
 
 def ai_result_info(session: AiSession) -> dict[str, object]:

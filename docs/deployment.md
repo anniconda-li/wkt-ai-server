@@ -62,11 +62,11 @@ docker compose config
 
 | 容器路径 | 用途 | 部署要求 |
 | --- | --- | --- |
-| `/app/uploads` | 相机 JPEG、JPEG 分片临时文件、相机 SQLite、设备上传 WAV、处理后的回复 WAV | 必须持久化；生产环境使用命名卷或宿主机受控目录 |
+| `/app/uploads` | 相机 JPEG、JPEG 分片、相机 SQLite、WAI1 SQLite/临时文件、设备上传 WAV、处理后的 WAV/ROP1 | 必须持久化；生产环境使用命名卷或宿主机受控目录 |
 | `/app/outputs` | 本地文本/TTS 客户端生成的回复文件 | 建议持久化；不用仓库内临时目录承载生产数据 |
 | `/app/data/artifacts` | 随镜像发布的只读文物知识卡 | 不挂载运行时空目录覆盖 |
 
-相机 `X-Request-ID` 幂等状态和 JPEG 分片元数据保存在 `/app/uploads/camera_idempotency.sqlite3`，SQLite 事务可在共享该文件与 `/app/uploads/camera_chunks` 的多个 worker 之间协调。未完成会话按 TTL 后台清理；识别中的会话通过续租避免被清理，进程异常后则会在租约过期后回收。但设备会话、聊天记忆和 `/ai` 处理状态仍保存在进程内存中，所以整体部署仍必须保持单进程、单副本；不要因为相机上传本身支持多 worker 就提高整个服务的 worker 数。容器重启会清空内存会话，客户端需要重新开始会话。
+相机 `X-Request-ID` 幂等状态和 JPEG 分片元数据保存在 `/app/uploads/camera_idempotency.sqlite3`。WAI1 会话和分片索引保存在 `/app/uploads/ai_ws.sqlite3`，字节位于 `/app/uploads/ai_ws`，可跨 WebSocket 断线恢复。SQLite 事务可协调共享文件系统上的 finish claim，但活跃连接替换、主动推送、聊天记忆和现有 AI runtime task 仍是进程内状态，所以整体部署必须保持单进程、单副本；不要因为上传状态使用 SQLite 就增加 worker 数。进程重启后已落盘上传仍可查询和清理，但已发出的模型任务不会自动跨进程恢复。
 
 ## HTTP 路由
 
@@ -93,6 +93,7 @@ docker compose config
 | `POST` | `/ai/result_chunk` | query：`session`、`offset`、`len`、可选 `device`；返回 `audio/wav` |
 | `POST` | `/ai/cancel` | query：`session`、可选 `device` |
 | `POST` | `/ai/stop_audio` | query：`session`、可选 `device` |
+| `WS` | `/ai/ws?device=...&protocol=wai1` | 独立 AI WebSocket；AOP1/JPEG 上传、状态推送、ROP1 下载与断线续传 |
 
 请求参数、状态码和响应字段的完整示例见仓库根目录 `README.md`。部署层不得重写这些路径或改变请求体编码。
 
@@ -122,6 +123,11 @@ docker compose config
 | 图片分片 | `CAMERA_CHUNK_SESSION_TTL_SECONDS`, `CAMERA_CHUNK_COMPLETED_TTL_SECONDS` | `600`, `1200` |
 | 图片分片 | `CAMERA_CHUNK_MAX_SESSIONS`, `CAMERA_CHUNK_MAX_TEMP_BYTES` | `100`, `67108864`（64 MiB） |
 | 图片分片 | `CAMERA_CHUNK_CLEANUP_INTERVAL_SECONDS` | `60` 秒 |
+| AI WebSocket | `AI_WS_DB_PATH`, `AI_WS_TEMP_DIR` | 默认 `/app/uploads/ai_ws.sqlite3`, `/app/uploads/ai_ws` |
+| AI WebSocket | `AI_WS_SESSION_TTL_SECONDS` | `1200`，代码强制最小 600 秒 |
+| AI WebSocket | `AI_WS_MAX_SESSIONS`, `AI_WS_MAX_SESSIONS_PER_DEVICE` | `200`, `4` |
+| AI WebSocket | `AI_WS_MAX_TEMP_BYTES`, `AI_WS_CLEANUP_INTERVAL_SECONDS` | `67108864`, `60` |
+| AI WebSocket | `AI_WS_SEND_QUEUE_SIZE` | `32` 条，满时关闭慢连接 |
 | ASR | `ASR_PROVIDER`, `ASR_MODEL` | `dashscope`, `qwen3-asr-flash-2026-02-10` |
 | ASR | `ASR_FALLBACK_MODEL` | `paraformer-realtime-v2`；留空禁用回退 |
 | ASR | `ASR_API_KEY` | 可选；默认复用 `DASHSCOPE_API_KEY` |
@@ -150,6 +156,7 @@ docker compose config
 | `/camera/upload/finish` | 空 body；同步等待视觉模型并返回最终 JSON | 响应读取超时建议 300 秒 |
 | `/ai/upload` | PCM WAV 最大 2,100,000 字节；AOP1 Opus 最大 262,144 字节；建议分片 32,768 字节 | 允许 `application/octet-stream` 和 `application/vnd.wkt.opus-packets`，不改写 query 或 raw body |
 | `/ai/result_chunk` | 单次最多返回 32,768 字节 | 允许 `audio/wav` 二进制响应 |
+| `/ai/ws` | WAI1 payload 最大 4096；30 秒无有效消息关闭；ROP1 最大 384 KiB | 必须转发 Upgrade；读写空闲超时建议 45 秒；关闭响应缓冲 |
 | TTS 回复 WAV | 最大 4,000,000 字节 | `/app/uploads` 需要足够磁盘空间 |
 | `/chat` | 流式纯文本响应 | 禁用代理响应缓冲，空闲/读取超时至少 120 秒 |
 | `/camera/upload` 视觉识别 | 请求会等待外部视觉模型返回 | 上游超时至少 120 秒；网络较慢时建议 300 秒 |
@@ -193,6 +200,17 @@ location = /camera/upload/cancel {
     client_max_body_size 1k;
     proxy_http_version 1.1;
     proxy_read_timeout 30s;
+    proxy_pass http://wkt_ai_server;
+}
+
+location = /ai/ws {
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_buffering off;
+    proxy_read_timeout 45s;
+    proxy_send_timeout 45s;
     proxy_pass http://wkt_ai_server;
 }
 ```

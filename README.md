@@ -27,6 +27,7 @@
 - `/chat` 聊天接口
 - `/camera/upload` JPEG 图片上传接口
 - `/camera/upload/chunk` + `/finish` JPEG 弱网分片上传接口
+- `/ai/ws?device=...&protocol=wai1` 独立 AI WebSocket（语音、相机、状态推送和 ROP1 回复）
 - `/ai/*` ESP32 语音分片上传、ASR、轮询结果、按需拉取 WAV 协议
 - 本地文本 -> LLM -> TTS -> ESP32 WAV 测试链路
 - 模型 streaming 输出
@@ -49,6 +50,10 @@
 .
 ├── main.py           # FastAPI app，定义 HTTP 接口
 ├── ai_protocol.py    # ESP32 /ai 语音协议、session、分片、取消状态
+├── ai_ws.py          # 独立 WAI1 WebSocket 生命周期、状态推送和后台任务
+├── ai_ws_store.py    # WAI1 SQLite 会话、分片索引和 TTL 清理
+├── wai1_protocol.py  # WAI1 32 字节二进制头编解码与 CRC32 校验
+├── rop1.py           # 回复 Opus 的 ROP1 容器编码、解析和 Ogg 回放
 ├── asr.py            # 调用 DashScope Paraformer，把设备 WAV 转成文字
 ├── pipeline.py       # 本地文本 -> LLM -> TTS -> 设备 WAV 流水线
 ├── tts.py            # 调用 TTS 并统一输出 ESP32 标准 WAV
@@ -80,6 +85,9 @@
 ├── .env.example      # 环境变量示例，不放真实 key
 └── .gitignore        # 忽略 .env、.venv、缓存文件
 ```
+
+WAI1 的完整 JSON、二进制头、ROP1、状态机、持久化限制和 Nginx 示例见
+[`docs/ai-websocket.md`](docs/ai-websocket.md)。旧 HTTP AI 和相机接口继续兼容。
 
 ## 实现流程
 

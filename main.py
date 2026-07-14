@@ -7,7 +7,7 @@ import re
 from time import perf_counter
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from starlette.requests import ClientDisconnect
@@ -24,6 +24,8 @@ from ai_protocol import (
     stop_ai_audio,
     write_ai_upload_chunk,
 )
+from ai_ws import serve_ai_websocket
+from ai_ws_store import AiWsSession, ai_ws_cleanup_interval_seconds, get_ai_ws_store
 from camera_idempotency import (
     CameraIdempotencyCapacityError,
     CameraIdempotencyStore,
@@ -88,6 +90,7 @@ app = FastAPI(
 )
 
 _camera_chunk_cleanup_task: asyncio.Task[None] | None = None
+_ai_ws_cleanup_task: asyncio.Task[None] | None = None
 
 
 async def camera_chunk_cleanup_loop() -> None:
@@ -99,23 +102,37 @@ async def camera_chunk_cleanup_loop() -> None:
             logger.error("camera.chunk.cleanup_failed error=%s", type(exc).__name__)
 
 
+async def ai_ws_cleanup_loop() -> None:
+    while True:
+        await asyncio.sleep(ai_ws_cleanup_interval_seconds())
+        try:
+            removed = await asyncio.to_thread(get_ai_ws_store().cleanup)
+            if removed:
+                logger.info("ai.ws.cleanup removed=%d", removed)
+        except Exception as exc:
+            logger.error("ai.ws.cleanup_failed error=%s", type(exc).__name__)
+
+
 @app.on_event("startup")
 async def start_camera_chunk_cleanup() -> None:
-    global _camera_chunk_cleanup_task
+    global _camera_chunk_cleanup_task, _ai_ws_cleanup_task
     _camera_chunk_cleanup_task = asyncio.create_task(camera_chunk_cleanup_loop())
+    _ai_ws_cleanup_task = asyncio.create_task(ai_ws_cleanup_loop())
 
 
 @app.on_event("shutdown")
 async def stop_camera_chunk_cleanup() -> None:
-    global _camera_chunk_cleanup_task
-    if _camera_chunk_cleanup_task is None:
-        return
-    _camera_chunk_cleanup_task.cancel()
-    try:
-        await _camera_chunk_cleanup_task
-    except asyncio.CancelledError:
-        pass
+    global _camera_chunk_cleanup_task, _ai_ws_cleanup_task
+    for task in (_camera_chunk_cleanup_task, _ai_ws_cleanup_task):
+        if task is None:
+            continue
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     _camera_chunk_cleanup_task = None
+    _ai_ws_cleanup_task = None
 
 
 def elapsed_ms(start: float) -> float:
@@ -1673,6 +1690,58 @@ async def cancel_camera_chunk_upload(
         result=result,
     )
     return {"accepted": True}
+
+
+async def process_ai_ws_camera(
+    session: AiWsSession,
+    image_bytes: bytes,
+) -> tuple[int, dict[str, Any]]:
+    """Run a WAI1 camera session through the existing camera workflow and idempotency store."""
+    total_start = perf_counter()
+    context = CameraLogContext(
+        device_id=session.device_id,
+        request_id=session.request_id,
+        content_length=session.total,
+        bytes_received=session.received,
+        sha256=session.sha256,
+        total_start=total_start,
+        offset=session.received,
+        chunk_size=0,
+        next_offset=session.received,
+    )
+    # The HTTP camera idempotency table historically keys request_id globally.  Namespace
+    # the internal key so identical device-local request IDs remain isolated.
+    identity = CameraRequestIdentity(
+        request_id=f"wai1:{session.device_id}:{session.request_id}",
+        device_id=session.device_id,
+        sha256=session.sha256,
+        content_length=session.total,
+    )
+    outcome = await process_idempotent_camera_upload(
+        get_camera_idempotency_store(),
+        identity,
+        context,
+        image_bytes,
+        "image/jpeg",
+        artifact_id="",
+        vision_description=None,
+        use_vision=True,
+    )
+    return outcome.status_code, outcome.payload
+
+
+@app.websocket("/ai/ws")
+async def ai_websocket(
+    websocket: WebSocket,
+    device: str = "default",
+    protocol: str = "",
+) -> None:
+    await serve_ai_websocket(
+        websocket,
+        device=device,
+        protocol=protocol,
+        camera_processor=process_ai_ws_camera,
+    )
 
 
 def raise_ai_http_error(exc: AiProtocolError) -> None:
