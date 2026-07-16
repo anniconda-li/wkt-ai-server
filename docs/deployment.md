@@ -65,6 +65,7 @@ docker compose config
 | `/app/uploads` | 相机 JPEG、JPEG 分片、相机 SQLite、WAI1 SQLite/临时文件、设备上传 WAV、处理后的 WAV/ROP1 | 必须持久化；生产环境使用命名卷或宿主机受控目录 |
 | `/app/outputs` | 本地文本/TTS 客户端生成的回复文件 | 建议持久化；不用仓库内临时目录承载生产数据 |
 | `/app/data/artifacts` | 随镜像发布的只读文物知识卡 | 不挂载运行时空目录覆盖 |
+| `/app/data/museum` | 随镜像发布的只读馆级资料卡 | 不挂载运行时空目录覆盖 |
 
 相机 `X-Request-ID` 幂等状态和 JPEG 分片元数据保存在 `/app/uploads/camera_idempotency.sqlite3`。WAI1 会话和分片索引保存在 `/app/uploads/ai_ws.sqlite3`，字节位于 `/app/uploads/ai_ws`，可跨 WebSocket 断线恢复。SQLite 事务可协调共享文件系统上的 finish claim，但活跃连接替换、主动推送、聊天记忆和现有 AI runtime task 仍是进程内状态，所以整体部署必须保持单进程、单副本；不要因为上传状态使用 SQLite 就增加 worker 数。进程重启后已落盘上传仍可查询和清理，但已发出的模型任务不会自动跨进程恢复。
 
@@ -220,7 +221,7 @@ location = /ai/ws {
 ## Git 与秘密边界
 
 - `.env`、`.env.*`（保留 `.env.example`）、`.venv`、`venv`、`uploads`、`outputs`、非版本化的 `data`/`samples` 内容、Python 缓存、私钥/证书密钥和 `secrets` 已被 Git 忽略。
-- `data/artifacts` 是运行必需、随源码版本化的静态知识卡，不是运行时数据。
+- `data/artifacts` 和 `data/museum` 是运行必需、随源码版本化的静态知识卡，不是运行时数据。
 - `samples/camera` 是既有离线测试夹具，不包含凭据，并已从 Docker 构建上下文排除。
 - 运行时上传、模型输出和真实密钥不得加入 Git，也不得烘焙进镜像。
 

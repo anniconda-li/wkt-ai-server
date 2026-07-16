@@ -309,6 +309,74 @@ class AiWebSocketIntegrationTests(unittest.TestCase):
         self.assertEqual(final_result["answer_text"], "这是应国玉鹰。")
         self.assertEqual(ready["type"], "reply_ready")
 
+    def test_voice_text_ready_is_pushed_before_audio_when_statuses_change_without_yield(self) -> None:
+        payload = build_aop1(3)
+
+        async def fake_pipeline(session_id: str) -> None:
+            runtime = ai_protocol.get_ai_session(session_id)
+            runtime.asr_text = "这是什么文物"
+            runtime.answer_text = "这是应国玉鹰。"
+            ai_protocol.set_status(runtime, "text_ready")
+            ai_protocol.set_status(runtime, "tts_running")
+            write_silence_wav(runtime.reply_wav_path, duration_seconds=0.2)
+            runtime.reply_wav_size = runtime.reply_wav_path.stat().st_size
+            ai_protocol.set_status(runtime, "audio_ready")
+
+        def fake_rop1(source: Path, destination: Path) -> Rop1File:
+            audio = Rop1Audio(1, 320, 104, 0, (b"\xf8\xff\xfe",))
+            data = build_rop1_bytes(audio)
+            destination.write_bytes(data)
+            return Rop1File(destination, len(data), sha(data), audio)
+
+        start = {
+            "type": "voice_start",
+            "request_id": "voice-text-first",
+            "language": "zh",
+            "input_format": "opus_packets_v1",
+            "total": len(payload),
+            "sha256": sha(payload),
+        }
+        with (
+            patch("ai_ws.process_ai_session", side_effect=fake_pipeline),
+            patch("ai_ws.encode_wav_to_rop1", side_effect=fake_rop1),
+            self.connect() as websocket,
+        ):
+            websocket.receive_json()
+            websocket.send_json(start)
+            started = websocket.receive_json()
+            websocket.send_bytes(
+                encode_wai1_packet(
+                    Wai1Packet(PACKET_VOICE_UPLOAD, 1, 0, 0, len(payload), payload)
+                )
+            )
+            websocket.receive_json()
+            websocket.send_json(
+                {
+                    "type": "voice_finish",
+                    "session": started["session"],
+                    "sha256": sha(payload),
+                }
+            )
+
+            messages = []
+            while not any(message.get("type") == "reply_ready" for message in messages):
+                messages.append(websocket.receive_json())
+
+        statuses = [
+            message["status"]
+            for message in messages
+            if message.get("type") == "result" and message.get("kind") == "voice"
+        ]
+        text_ready_index = statuses.index("text_ready")
+        audio_ready_index = statuses.index("audio_ready")
+        self.assertLess(text_ready_index, audio_ready_index)
+        text_ready = next(
+            message
+            for message in messages
+            if message.get("type") == "result" and message.get("status") == "text_ready"
+        )
+        self.assertEqual(text_ready["answer_text"], "这是应国玉鹰。")
+
     def test_reply_get_supports_stop_and_wait_and_reconnect_offset(self) -> None:
         store = get_ai_ws_store()
         session = store.start(device_id="reply-device", request_id="reply", kind="voice", total=1, sha256=sha(b"x"))

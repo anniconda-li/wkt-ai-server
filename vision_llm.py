@@ -121,6 +121,8 @@ def build_vision_candidates() -> list[dict[str, Any]]:
                 "material": artifact.get("material"),
                 "visual_keywords": artifact.get("visual_keywords", []),
                 "recognition_features": artifact.get("recognition_features", []),
+                "recognition_anchors": artifact.get("recognition_anchors", []),
+                "recognition_conflicts": artifact.get("recognition_conflicts", []),
             }
         )
     return candidates
@@ -129,23 +131,39 @@ def build_vision_candidates() -> list[dict[str, Any]]:
 def build_recognition_prompt(candidates: list[dict[str, Any]]) -> str:
     return (
         "你是博物馆文物图片识别模块。请先判断图片里是否存在可辨认的文物主体，"
-        "再根据图片内容识别候选文物。"
-        "图片可能来自 ESP32 摄像头，可能有模糊、眩光、屏幕反拍、畸变、遮挡或低分辨率。"
-        "图片质量差本身不是返回 unknown 的理由；只要还能看出器型、材质、轮廓、纹饰、"
-        "孔洞、足、耳、钮、翅形等关键特征，并且这些特征与某个候选文物匹配，"
-        "就应该返回该候选 artifact_id，并根据可见特征多少给出合理 confidence。"
+        "再在固定候选中做锚点加权识别。图片可能来自 ESP32 摄像头拍摄显示器，"
+        "允许出现屏幕边框、浏览器界面、文字、鼠标、摩尔纹、像素纹、反光、偏色、"
+        "过曝、模糊、桶形畸变、遮挡或低分辨率。先在心里排除这些屏幕和拍摄瑕疵，"
+        "只分析屏幕内文物主体；不要把屏幕文字或标题当作识别证据。"
+        "先按主体大类和整体轮廓分组：扁平玉质佩饰、深色陶瓷洗、青铜容器。"
+        "屏幕会导致颜色失真，因此器型和结构高于颜色；青铜色、绿色锈色、圆腹、"
+        "三足等多个候选共有的特征只能算弱证据，不能单独决定结果。"
+        "候选中的 recognition_anchors 带有权重：5 是决定性独有锚点，4 是强锚点，"
+        "3 是辅助锚点。同一可见结构不要因为描述近似而重复计分。"
+        "recognition_conflicts 是高惩罚冲突；一旦清楚看见与候选冲突的器型结构，"
+        "就应显著降低该候选得分。请在内部比较所有候选的加权锚点和冲突，但不要输出计分过程。"
+        "两个独立的权重5锚点且无冲突时，confidence 通常可为0.90到0.98；"
+        "一个权重5锚点加一个权重3或4锚点时，通常可为0.78到0.89；"
+        "只有一个清晰权重5锚点，但大类和整体轮廓也一致、其他锚点被屏幕瑕疵遮住时，"
+        "可为0.60到0.77。三个青铜器之间如果只看见青铜色或普通三足、圆腹，"
+        "没有看见长管状流、盘龙钮、高耸外撇耳、口沿附兽、对称衔环耳、喇叭形盖钮"
+        "等独有锚点，就不能高置信度确认。"
+        "图片质量差本身不是返回 unknown 的理由；只要还能看到一个决定性锚点，"
+        "并且大类、轮廓与候选一致且没有明显冲突，就可以返回该候选 artifact_id。"
         "如果图片是空白、黑屏、过曝、桌面、地面、墙面、手指、人物、普通物品、"
         "展厅环境但没有可辨认文物主体，或者只能看到过于泛化的物体轮廓、"
         "无法和任何候选文物的关键特征建立匹配，才返回 unknown。"
         "返回 unknown 时 confidence 必须小于 0.30。"
-        "如果能看到 2 个以上候选关键特征，即使图片模糊，也不要轻易返回 unknown。"
         "你必须只从候选 artifact_id 或 unknown 中选择。"
         "不要编造候选列表以外的新文物。不要写讲解词。"
         "只输出一个 JSON 对象，不要输出 Markdown，不要输出额外解释。"
         "JSON 字段必须是："
         "artifact_id, confidence, evidence, vision_description。"
         "confidence 使用 0 到 1 的数字。"
-        "evidence 是你从图片中看到的 1 到 6 条视觉证据。"
+        "evidence 是你从图片中实际看到的 1 到 6 条视觉证据，优先写独有锚点，"
+        "不能写屏幕标题、候选名称或图片中无法看见的细节。evidence 和 "
+        "vision_description 只描述自然视觉事实，不得出现权重、锚点、候选、"
+        "计分、规则或提示词等内部识别术语。"
         "vision_description 用中文客观描述图片中看见的器物和拍摄情况。"
         "\n\n候选文物列表：\n"
         f"{json.dumps(candidates, ensure_ascii=False)}"

@@ -5,6 +5,11 @@ from typing import AsyncIterator, Callable
 
 from artifacts import ArtifactNotFoundError, find_artifacts_by_text, get_artifact, to_llm_context
 from llm import stream_chat_completion
+from museum import (
+    is_museum_question,
+    load_museum_profile,
+    to_llm_context as museum_to_llm_context,
+)
 from output_format import format_for_device_display
 from sessions import DeviceSession, get_session, remember_turn
 from text_normalize import normalize_artifact_mentions
@@ -15,12 +20,15 @@ SYSTEM_PROMPT = (
     "You are a museum guide speaking directly to a visitor through a small "
     "device. Your answer is displayed to the visitor, so do not describe how "
     "to guide, teach, present, or explain. Just give the final visitor-facing "
-    "answer. Use only the provided artifact facts as factual grounding. If "
+    "answer. Use only the provided museum and artifact facts as factual "
+    "grounding. If "
     "details are marked as pending confirmation, say briefly that the exhibit "
     "record is still being completed instead of inventing dates, provenance, "
     "or stories. If the visitor asks who you are, say that you are the AI "
     "museum guide assistant for Pingdingshan Museum, and answer directly. "
-    "Do not mention special exhibitions, current exhibits, featured exhibits, "
+    "Treat regular opening hours as the normal schedule, not proof that the "
+    "museum is open today. Do not mention special exhibitions, current "
+    "exhibits, featured exhibits, "
     "or today-specific arrangements unless that information is explicitly "
     "provided in the context. Do not end with an offer that assumes a specific "
     "artifact or exhibition exists. Output plain text only: no Markdown, no "
@@ -65,7 +73,7 @@ def direct_response_for(user_message: str, session: DeviceSession) -> str | None
             "或者直接说出文物名称，我会根据已配置的馆方资料为你做简短讲解。"
         )
 
-    if not is_vague_intro_request(user_message):
+    if is_museum_question(user_message) or not is_vague_intro_request(user_message):
         return None
     if find_artifacts_by_text(user_message) or session.latest_artifact_id:
         return None
@@ -80,14 +88,14 @@ def direct_response_for(user_message: str, session: DeviceSession) -> str | None
 
 
 def resolve_artifact_context(
-    user_message: str, session: DeviceSession
+    user_message: str, session: DeviceSession, *, inherit_latest: bool = True
 ) -> list[dict[str, object]]:
     artifact_matches = find_artifacts_by_text(user_message)
     if artifact_matches:
         session.latest_artifact_id = str(artifact_matches[0]["id"])
         return artifact_matches
 
-    if session.latest_artifact_id:
+    if inherit_latest and session.latest_artifact_id:
         try:
             return [get_artifact(session.latest_artifact_id)]
         except ArtifactNotFoundError:
@@ -101,7 +109,30 @@ def build_messages(user_message: str, session: DeviceSession) -> list[dict[str, 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(session.memory)
 
-    artifact_matches = resolve_artifact_context(user_message, session)
+    museum_question = is_museum_question(user_message)
+    artifact_matches = resolve_artifact_context(
+        user_message,
+        session,
+        inherit_latest=not museum_question,
+    )
+
+    if museum_question:
+        museum_context = museum_to_llm_context(load_museum_profile())
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Matched the local Pingdingshan Museum knowledge profile. "
+                    "Use these facts and answer policies for the visitor's "
+                    "museum-level question. Do not expose internal policies or "
+                    "data fields. If the requested visitor information is not "
+                    "included, say that it has not been confirmed and direct "
+                    "the visitor to the official notice or museum telephone:\n"
+                    f"{json.dumps(museum_context, ensure_ascii=False)}"
+                ),
+            }
+        )
+
     if artifact_matches:
         artifact_context = [to_llm_context(artifact) for artifact in artifact_matches]
         messages.append(
@@ -113,6 +144,17 @@ def build_messages(user_message: str, session: DeviceSession) -> list[dict[str, 
                     "say 'you can explain', do not give instructions to a "
                     "guide, and do not describe the answer strategy:\n"
                     f"{json.dumps(artifact_context, ensure_ascii=False)}"
+                ),
+            }
+        )
+    elif museum_question:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "This is a museum-level question and does not require a "
+                    "recognized artifact. Answer it from the museum profile "
+                    "instead of asking the visitor to take a photo."
                 ),
             }
         )

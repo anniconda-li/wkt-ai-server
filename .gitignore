@@ -17,6 +17,8 @@ secrets/
 data/*
 !data/artifacts/
 !data/artifacts/*.json
+!data/museum/
+!data/museum/*.json
 samples/*
 !samples/camera/
 !samples/camera/README.md
