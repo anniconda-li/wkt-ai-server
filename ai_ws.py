@@ -391,18 +391,50 @@ class AiWsProtocol:
         if session.reply_total:
             self.connection.enqueue_json(_reply_ready(session))
 
-    async def _on_voice_status(self, stored_session_id: str, runtime: AiSession) -> None:
-        status = runtime.status
+    async def _on_voice_status(
+        self,
+        stored_session_id: str,
+        status: str,
+        asr_text: str,
+        answer_text: str,
+        error: str | None,
+    ) -> None:
         if status == "audio_ready":
             status = "tts_running"
         elif status == "llm_running":
             status = "asr_running"
         elif status == "audio_failed":
             status = "failed"
-        result = {"asr_text": runtime.asr_text, "answer_text": runtime.answer_text}
+        result = {"asr_text": asr_text, "answer_text": answer_text}
         state = "failed" if status == "failed" else "cancelled" if status == "cancelled" else None
-        stored = await asyncio.to_thread(self.store.update_status, stored_session_id, status, result=result, error=runtime.error, state=state)
-        ai_ws_hub.publish(stored.device_id, _voice_result(stored, runtime))
+        stored = await asyncio.to_thread(
+            self.store.update_status,
+            stored_session_id,
+            status,
+            result=result,
+            error=error,
+            state=state,
+        )
+        published = ai_ws_hub.publish(
+            stored.device_id,
+            {
+                "type": "result",
+                "session": stored.session_id,
+                "kind": "voice",
+                "status": status,
+                "asr_text": asr_text,
+                "answer_text": answer_text,
+                "error": error,
+            },
+        )
+        logger.info(
+            "ai.ws.voice.status device=%s session=%s status=%s answer_chars=%d published=%s",
+            stored.device_id,
+            stored.session_id,
+            status,
+            len(answer_text),
+            published,
+        )
 
     async def _process_voice(self, stored: AiWsSession) -> None:
         if stored.temp_path is None:
@@ -416,15 +448,37 @@ class AiWsProtocol:
         runtime.total_size = stored.total
         runtime.received_chunks = {0: stored.total}
         loop = asyncio.get_running_loop()
+        pending_status_task: asyncio.Task[None] | None = None
+
+        def schedule_status(snapshot: tuple[str, str, str, str | None]) -> None:
+            nonlocal pending_status_task
+            previous = pending_status_task
+
+            async def publish_after_previous() -> None:
+                if previous is not None:
+                    await previous
+                await self._on_voice_status(stored.session_id, *snapshot)
+
+            pending_status_task = asyncio.create_task(publish_after_previous())
 
         def status_callback(current: AiSession) -> None:
-            loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(self._on_voice_status(stored.session_id, current))
+            snapshot = (
+                current.status,
+                current.asr_text,
+                current.answer_text,
+                current.error,
             )
+            loop.call_soon_threadsafe(schedule_status, snapshot)
+
+        async def drain_status_updates() -> None:
+            await asyncio.sleep(0)
+            if pending_status_task is not None:
+                await pending_status_task
 
         runtime.status_callback = status_callback
         try:
             await process_ai_session(runtime.session_id)
+            await drain_status_updates()
             if runtime.status == "audio_ready" and runtime.reply_wav_path is not None:
                 rop1_file = await asyncio.to_thread(
                     encode_wav_to_rop1, runtime.reply_wav_path, root / "reply.rop1"
@@ -458,6 +512,9 @@ class AiWsProtocol:
             logger.exception("ai.ws.voice.failed session=%s error=%s", stored.session_id, type(exc).__name__)
             failed = await asyncio.to_thread(self.store.update_status, stored.session_id, "failed", error=str(exc), state="failed")
             ai_ws_hub.publish(failed.device_id, _voice_result(failed, runtime))
+        finally:
+            runtime.status_callback = None
+            await drain_status_updates()
 
     async def _process_camera(self, stored: AiWsSession, image_bytes: bytes) -> None:
         try:
