@@ -24,8 +24,18 @@ SYSTEM_PROMPT = (
     "grounding. If "
     "details are marked as pending confirmation, say briefly that the exhibit "
     "record is still being completed instead of inventing dates, provenance, "
-    "or stories. If the visitor asks who you are, say that you are the AI "
-    "museum guide assistant for Pingdingshan Museum, and answer directly. "
+    "or stories. If the visitor asks who you are or asks you to introduce "
+    "yourself, reply with exactly '\u6211\u662f\u535a\u7269\u9986AI\u8bb2\u89e3\u5458\u3002' and nothing else. "
+    "Never include a museum name or any geographic name in that identity "
+    "reply. When introducing an artifact, do not mention geographic names "
+    "below the province level, including city, county, district, town, "
+    "village, excavation-site, tomb-site, or other detailed place names, "
+    "even if they appear in the visitor's question, conversation history, "
+    "museum profile, artifact facts, or visual context. Province-level and "
+    "country-level geographic names may be used when relevant. Omit a "
+    "disallowed place name or generalize it to the province level without "
+    "inventing information. Do not use a museum or institution name as a "
+    "way to repeat a disallowed city-level or more detailed place name. "
     "Treat regular opening hours as the normal schedule, not proof that the "
     "museum is open today. Do not mention special exhibitions, current "
     "exhibits, featured exhibits, "
@@ -68,10 +78,7 @@ def is_vague_intro_request(user_message: str) -> bool:
 
 def direct_response_for(user_message: str, session: DeviceSession) -> str | None:
     if is_identity_question(user_message):
-        return (
-            "你好，我是平顶山市博物馆的 AI 讲解助手。你可以拍一张展品照片，"
-            "或者直接说出文物名称，我会根据已配置的馆方资料为你做简短讲解。"
-        )
+        return "我是博物馆AI讲解员。"
 
     if is_museum_question(user_message) or not is_vague_intro_request(user_message):
         return None
@@ -142,7 +149,10 @@ def build_messages(user_message: str, session: DeviceSession) -> list[dict[str, 
                     "Matched local artifact knowledge cards. These are facts "
                     "for generating the final visitor-facing answer. Do not "
                     "say 'you can explain', do not give instructions to a "
-                    "guide, and do not describe the answer strategy:\n"
+                    "guide, and do not describe the answer strategy. Apply "
+                    "the system location policy strictly: artifact answers "
+                    "must omit or generalize every geographic name below the "
+                    "province level, even when a fact below contains one:\n"
                     f"{json.dumps(artifact_context, ensure_ascii=False)}"
                 ),
             }

@@ -2,7 +2,7 @@ import json
 import unittest
 
 from museum import is_museum_question, load_museum_profile, to_llm_context
-from router import build_messages, direct_response_for
+from router import SYSTEM_PROMPT, build_messages, direct_response_for
 from sessions import DeviceSession
 
 
@@ -80,6 +80,31 @@ class MuseumKnowledgeTests(unittest.TestCase):
 
         self.assertIsNone(direct_response_for("介绍一下博物馆", session))
         self.assertIsNotNone(direct_response_for("介绍一下", session))
+
+    def test_identity_response_is_location_free_and_exact(self) -> None:
+        session = DeviceSession(device_id="identity-test")
+
+        for question in ("你是谁？", "介绍一下你自己"):
+            with self.subTest(question=question):
+                self.assertEqual(
+                    direct_response_for(question, session),
+                    "我是博物馆AI讲解员。",
+                )
+
+    def test_system_prompt_limits_artifact_locations_to_province_level(self) -> None:
+        self.assertIn("reply with exactly '我是博物馆AI讲解员。'", SYSTEM_PROMPT)
+        self.assertIn("below the province level", SYSTEM_PROMPT)
+        self.assertIn("city, county, district, town", SYSTEM_PROMPT)
+
+        session = DeviceSession(device_id="artifact-location-policy-test")
+        messages = build_messages("介绍一下应国玉鹰", session)
+        artifact_instruction = next(
+            message["content"]
+            for message in messages
+            if message["content"].startswith("Matched local artifact knowledge cards")
+        )
+        self.assertIn("omit or generalize every geographic name", artifact_instruction)
+        self.assertIn("below the province level", artifact_instruction)
 
     def test_llm_context_excludes_source_urls(self) -> None:
         context = to_llm_context()
